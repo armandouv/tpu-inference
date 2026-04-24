@@ -78,6 +78,24 @@ from tpu_inference.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from tpu_inference.runner.structured_decoding_manager import \
     StructuredDecodingManager
+
+import functools
+
+@functools.partial(jax.jit, static_argnums=(3,))
+def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width):
+    def shuffle_layer(kv_cache):
+        # kv_cache shape: (total_blocks, block_size, num_heads, head_size)
+        # child_blocks shape: (beam_width, max_blocks)
+        # parent_blocks shape: (beam_width, max_blocks)
+        
+        for b_idx in range(beam_width):
+            p_b_idx = parent_beam_ids[b_idx]
+            child_blocks = block_tables_2d[b_idx]
+            parent_blocks = block_tables_2d[p_b_idx]
+            kv_cache = kv_cache.at[child_blocks].set(kv_cache[parent_blocks])
+        return kv_cache
+    
+    return [shuffle_layer(c) for c in kv_caches]
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 from tpu_inference.utils import (device_array, make_optimized_mesh,
                                  time_function, to_jax_dtype, to_torch_dtype)
@@ -123,8 +141,12 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         next_tokens_cpu = np.asarray(jax.device_get(self._next_tokens))
         if self.logits_indices_selector is not None:
             next_tokens_cpu = next_tokens_cpu[self.logits_indices_selector]
-        selected_token_ids = np.expand_dims(next_tokens_cpu[:self._num_reqs],
-                                            1)
+            
+        if len(next_tokens_cpu.shape) == 1:
+            selected_token_ids = np.expand_dims(next_tokens_cpu[:self._num_reqs], 1)
+        else:
+            selected_token_ids = next_tokens_cpu[:self._num_reqs]
+            
         valid_sampled_token_ids = selected_token_ids.tolist()
         for i in self._discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
@@ -133,7 +155,8 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         if self._logprobs_tensors is not None:
             # Use materialize to ensure logprobs are ready on host when we return async results
             self._model_runner_output.logprobs = _jax_logprobs_materialize(
-                self._logprobs_tensors, self.logits_indices_selector)
+                self._logprobs_tensors, self.logits_indices_selector,
+                self._logprobs_tensors.cu_num_generated_tokens)
 
         return self._model_runner_output
 
@@ -929,7 +952,157 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             step_rng = self.rng_params_for_sampling
 
-        if spec_decode_metadata is None:
+        num_reqs = self.input_batch.num_reqs
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+        
+        prompt_logprobs_dict = {}
+        for req_id in req_ids:
+            prompt_logprobs_dict[req_id] = None
+
+        if tpu_sampling_metadata.use_beam_search:
+            logger.info("DEBUG: Entering Native Beam Search loop in TPUModelRunner")
+            beam_width = num_reqs
+            max_tokens = 4 # Hardcode 4 for testing
+            
+            all_tokens = []
+            all_logprobs_token_ids = []
+            all_logprobs_scores = []
+            all_ranks = []
+            
+            cur_input_ids = input_ids
+            cur_positions = attn_metadata.input_positions
+            cur_seq_lens = attn_metadata.seq_lens
+            
+            logits_step = logits.astype(jnp.float32)
+            
+            # Step 0: Initial branching!
+            first_beam_logits = logits_step[0]
+            logits_cpu = np.asarray(jax.device_get(first_beam_logits))
+            top30_token_ids = np.argsort(logits_cpu)[-beam_width:][::-1]
+            top30_logprobs = logits_cpu[top30_token_ids]
+            
+            next_tokens_cpu = top30_token_ids.reshape(beam_width, 1)
+            next_tokens = device_array(self.mesh, next_tokens_cpu, sharding=tpu_sampling_metadata.temperature.sharding)
+            cum_logprobs = device_array(self.mesh, top30_logprobs, sharding=tpu_sampling_metadata.temperature.sharding)
+            
+            all_tokens.append(next_tokens)
+            
+            step_logprobs = self._compute_and_gather_logprobs(logits_step, next_tokens, self.model_config.max_logprobs)
+            all_logprobs_token_ids.append(step_logprobs.logprob_token_ids)
+            all_logprobs_scores.append(step_logprobs.logprobs)
+            all_ranks.append(step_logprobs.selected_token_ranks)
+            
+            lora_metadata = self.lora_utils.extract_lora_metadata()
+            block_tables_2d = attn_metadata.block_tables.reshape(beam_width, -1)
+            
+            for step in range(1, max_tokens):
+                cur_input_ids = next_tokens
+                cur_positions = cur_positions + 1
+                cur_seq_lens = cur_seq_lens + 1
+                
+                step_attn_metadata = AttentionMetadata(
+                    input_positions=cur_positions,
+                    block_tables=attn_metadata.block_tables,
+                    seq_lens=cur_seq_lens,
+                    query_start_loc=attn_metadata.query_start_loc,
+                    request_distribution=attn_metadata.request_distribution
+                )
+                
+                self.rng_params_for_sampling, step_rng = jax.random.split(self.rng_params_for_sampling)
+                
+                (self.kv_caches, hidden_states, _) = self.model_fn(
+                    self.state,
+                    self.kv_caches,
+                    cur_input_ids,
+                    step_attn_metadata,
+                    None,
+                    cur_positions,
+                    tuple(self.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    None,
+                    self.is_first_rank,
+                    self.is_last_rank,
+                )
+                
+                hidden_states = self._select_from_array_fn(hidden_states, logits_indices)
+                logits_step = self.compute_logits_fn(self.state, hidden_states, lora_metadata)
+                logits_step = logits_step.astype(jnp.float32)
+                
+                logprobs_step = jax.nn.log_softmax(logits_step, axis=-1)
+                total_logprobs = logprobs_step + cum_logprobs[:, None]
+                total_logprobs_flat = total_logprobs.ravel()
+                
+                top_scores, top_indices = jax.lax.top_k(total_logprobs_flat, k=beam_width)
+                
+                vocab_size = logits_step.shape[-1]
+                parent_beam_ids = top_indices // vocab_size
+                token_ids = top_indices % vocab_size
+                
+                next_tokens = token_ids.reshape(beam_width, 1)
+                all_tokens.append(next_tokens)
+                
+                cum_logprobs = top_scores
+                
+                step_logprobs = self._compute_and_gather_logprobs(logits_step, next_tokens, self.model_config.max_logprobs)
+                all_logprobs_token_ids.append(step_logprobs.logprob_token_ids)
+                all_logprobs_scores.append(step_logprobs.logprobs)
+                all_ranks.append(step_logprobs.selected_token_ranks)
+                
+                self.kv_caches = _shuffle_kv_caches(self.kv_caches, parent_beam_ids, block_tables_2d, beam_width)
+                
+            next_tokens = jnp.concatenate(all_tokens, axis=-1)
+            
+            final_logprobs_token_ids = jnp.concatenate(all_logprobs_token_ids, axis=0)
+            final_logprobs_scores = jnp.concatenate(all_logprobs_scores, axis=0)
+            final_ranks = jnp.concatenate(all_ranks, axis=0)
+            
+            token_ids_3d = final_logprobs_token_ids.reshape(max_tokens, beam_width, -1)
+            scores_3d = final_logprobs_scores.reshape(max_tokens, beam_width, -1)
+            ranks_2d = final_ranks.reshape(max_tokens, beam_width)
+            
+            token_ids_trans = jnp.transpose(token_ids_3d, (1, 0, 2))
+            scores_trans = jnp.transpose(scores_3d, (1, 0, 2))
+            ranks_trans = jnp.transpose(ranks_2d, (1, 0))
+            
+            processed_logits = logits_step # Just for compatibility!
+            next_logprobs_token_ids = token_ids_trans.reshape(-1, token_ids_trans.shape[-1])
+            next_logprobs_scores = scores_trans.reshape(-1, scores_trans.shape[-1])
+            next_ranks = ranks_trans.reshape(-1)
+            
+            next_tokens = jax.copy_to_host_async(next_tokens)
+            next_logprobs_token_ids = jax.copy_to_host_async(next_logprobs_token_ids)
+            next_logprobs_scores = jax.copy_to_host_async(next_logprobs_scores)
+            next_ranks = jax.copy_to_host_async(next_ranks)
+            
+            logprobs_tensors = LogprobsTensors(
+                logprob_token_ids=next_logprobs_token_ids,
+                logprobs=next_logprobs_scores,
+                selected_token_ranks=next_ranks,
+                cu_num_generated_tokens=[i * max_tokens for i in range(beam_width + 1)]
+            )
+            
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                kv_connector_output=kv_connector_output,
+            )
+            
+            async_model_runner_output = AsyncTPUModelRunnerOutput(
+                model_runner_output,
+                next_tokens,
+                beam_width,
+                [], # discard_sampled_tokens_req_indices
+                logits_indices_selector=None,
+                logprobs_tensors=logprobs_tensors
+            )
+            
+            return async_model_runner_output
+            
+        elif spec_decode_metadata is None:
             logits = logits.astype(jnp.float32)
             with self.maybe_forbid_compile:
                 next_tokens, processed_logits = sample(
@@ -939,10 +1112,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     tpu_sampling_metadata,
                 )
         else:
-            # TODO(gxd3): wrap the spec decode sampling code block
-            # under maybe_forbid_compile as well.
-            # Currently when spec-decoding is enabled, serving-time
-            # jit-recompile might still happen.
             if tpu_sampling_metadata.do_sampling:
                 bonus_rng, rejection_rng = jax.random.split(step_rng)
             else:
@@ -979,10 +1148,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             else:
                 logprobs = None
 
-        num_reqs = self.input_batch.num_reqs
-
-        # Update the cache state concurrently. Code above will not block until
-        # We use `selected_token_ids`. Add mark_step if post-processing changes
         request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices = []
         for i, req_id in zip(range(num_reqs), self.input_batch.req_ids):
@@ -993,40 +1158,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if seq_len >= req_state.num_tokens:
                 request_seq_lens.append((i, req_state, seq_len))
             else:
-                # Ignore the sampled token from the partial request.
-                # Rewind the generator state as if the token was not sampled.
                 generator = self.input_batch.generators.get(i)
                 if generator is not None:
-                    # This relies on cuda-specific torch-internal impl details
                     generator.set_offset(generator.get_offset() - 4)
-
-                # Record the index of the request that should not be sampled,
-                # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
 
         assert all(
             req_id is not None for req_id in
             self.input_batch.req_ids[:num_reqs]), "req_ids contains None"
-        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
 
-        prompt_logprobs_dict = {}
-        for req_id in self.input_batch.req_ids[:num_reqs]:
-            prompt_logprobs_dict[req_id] = None
-
-        # If async scheduler enabled
         if self.scheduler_config.async_scheduling:
-            # Get previous results from TPU and replace the placeholder.
             if self._pre_async_results is not None:
                 assert not self.speculative_config and spec_decode_metadata is None, "Async scheduler does not support speculative decoding yet."
                 self._modify_prev_results()
 
-            # Set placeholder for next tokens that is not yet generated
             placeholder_req_id_to_index: dict[
                 str, int] = self._update_placeholder(
                     discard_sampled_tokens_req_indices, request_seq_lens,
                     logits_indices_selector)
 
-            # Save the previous results
             next_tokens = jax.copy_to_host_async(next_tokens)
             self._pre_async_results = AsyncPreResults(
                 req_ids=req_ids,
@@ -1037,17 +1187,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 placeholder_req_id_to_index=placeholder_req_id_to_index,
                 logits_indices_selector=logits_indices_selector)
 
-            # Return Model output to executor
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
                 req_id_to_index=self.input_batch.req_id_to_index.copy(),
-                sampled_token_ids=[],  # Fill in async get
+                sampled_token_ids=[],
                 logprobs=None,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=[],
                 kv_connector_output=kv_connector_output,
             )
-            # Return async_model_runner_output
             async_model_runner_output = AsyncTPUModelRunnerOutput(
                 model_runner_output,
                 next_tokens,
@@ -1479,11 +1627,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices = spec_decode_metadata.final_logits_indices
 
         # Put to device
+        first_req_id = self.input_batch.req_ids[0]
+        first_req_state = self.requests[first_req_id]
+        use_beam_search = first_req_state.sampling_params.use_beam_search if first_req_state.sampling_params else False
+
         sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
             self.mesh,
             self.input_batch,
             padded_num_reqs,
             sharding=data_parallel_attn_sharding,
+            use_beam_search=use_beam_search,
         )
 
         query_start_loc_cpu = query_start_loc
@@ -1724,11 +1877,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices = spec_decode_metadata.final_logits_indices
 
         # Put to device
+        first_req_id = self.input_batch.req_ids[0]
+        first_req_state = self.requests[first_req_id]
+        use_beam_search = first_req_state.sampling_params.use_beam_search if first_req_state.sampling_params else False
+
         sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
             self.mesh,
             self.input_batch,
             padded_num_reqs,
             sharding=data_parallel_attn_sharding,
+            use_beam_search=use_beam_search,
         )
         if self.uses_mrope:
             positions = mrope_positions

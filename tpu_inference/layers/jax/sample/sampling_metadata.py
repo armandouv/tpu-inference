@@ -40,7 +40,7 @@ DEFAULT_SAMPLING_PARAMS = dict(
         "top_p",
         "_cache_collision_dummy",
     ],
-    meta_fields=["do_sampling", "logprobs"],
+    meta_fields=["do_sampling", "logprobs", "use_beam_search"],
 )
 @dataclass
 class TPUSupportedSamplingMetadata:
@@ -50,6 +50,7 @@ class TPUSupportedSamplingMetadata:
     _cache_collision_dummy: Optional[jnp.ndarray] = None
     do_sampling: bool = False
     logprobs: bool = False
+    use_beam_search: bool = False
 
     @classmethod
     def from_input_batch(
@@ -58,6 +59,7 @@ class TPUSupportedSamplingMetadata:
         input_batch: InputBatch,
         padded_num_reqs: int,
         sharding: Optional[jax.sharding.Sharding] = None,
+        use_beam_search: bool = False,
     ) -> "TPUSupportedSamplingMetadata":
         needs_logprobs = input_batch.max_num_logprobs > 0 if input_batch.max_num_logprobs else False
 
@@ -103,4 +105,5 @@ class TPUSupportedSamplingMetadata:
             _cache_collision_dummy=cache_collision_dummy,
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,
+            use_beam_search=use_beam_search,
         )
