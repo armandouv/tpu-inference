@@ -81,7 +81,7 @@ from tpu_inference.runner.structured_decoding_manager import \
 
 import functools
 
-@functools.partial(jax.jit, static_argnums=(3,))
+@functools.partial(jax.jit, static_argnums=(3,), donate_argnums=(0,))
 def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width):
     def shuffle_layer(kv_cache):
         # kv_cache shape: (total_blocks, block_size, num_heads, head_size)

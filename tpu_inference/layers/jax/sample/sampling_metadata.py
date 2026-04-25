@@ -75,7 +75,8 @@ class TPUSupportedSamplingMetadata:
         if input_batch.all_greedy:
             return cls(do_sampling=False,
                        logprobs=needs_logprobs,
-                       _cache_collision_dummy=cache_collision_dummy)
+                       _cache_collision_dummy=cache_collision_dummy,
+                       use_beam_search=use_beam_search)
         num_reqs = input_batch.num_reqs
 
         def fill_slice(cpu_torch_tensor: torch.Tensor,
