@@ -943,8 +943,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         padded_num_reqs: Optional[int] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if padded_num_reqs is None:
-            padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
-                self.input_batch.num_reqs, self.max_num_reqs)
+            if tpu_sampling_metadata.use_beam_search:
+                padded_num_reqs = 32
+            else:
+                padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
+                    self.input_batch.num_reqs, self.max_num_reqs)
 
         if tpu_sampling_metadata.do_sampling:
             self.rng_params_for_sampling, step_rng = jax.random.split(
@@ -960,20 +963,104 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             prompt_logprobs_dict[req_id] = None
 
         if tpu_sampling_metadata.use_beam_search:
-            logger.info("DEBUG: Entering Native Beam Search loop in TPUModelRunner")
-            beam_width = num_reqs
-            max_tokens = 4 # Hardcode 4 for testing
+            logger.info(f"DEBUG: Entering Native Beam Search loop. Batch size={num_reqs}, Requests={req_ids}")
+            assert num_reqs == 1, f"Expected 1 request in batch for beam search, got {num_reqs}!"
+            beam_width = 30
+            
+            first_req_id = req_ids[0]
+            first_req_state = self.requests[first_req_id]
+            max_tokens = first_req_state.sampling_params.max_tokens if first_req_state.sampling_params else 4
+            logger.info(f"DEBUG: Running beam search loop for {max_tokens} tokens")
+            
+            is_prefill = hidden_states.shape[0] > 1
+            
+            if is_prefill:
+                # During Prefill, model has already run for the prompt.
+                # We just take the logits of the last token and find 30 candidates!
+                logits_step = logits[-1:] # Shape (1, vocab_size)
+                
+                # Find top 30 candidates!
+                top30_logits, top30_tokens = jax.lax.top_k(logits_step, beam_width)
+                
+                # Now we have 30 beams!
+                # We can start the Decode loop for max_tokens - 1 steps!
+                # (Wait! We can just let this step return the 30 candidates!)
+                # And the NEXT step will be Decode!
+                # And the scheduler will schedule them?
+                # NO! The scheduler only knows about 1 request!
+                # So the NEXT step will still only be 1 request!
+                # So we MUST run the Decode loop entirely inside this function!!!
+                
+                # Let's run the Decode loop for max_tokens - 1 steps!
+                cur_input_ids_np = np.asarray(top30_tokens).reshape(30, 1)
+                
+                # Scratchpad Block Theft!
+                beam_0_block_ids = self.input_batch.block_table[0].get_cpu_tensor()[0]
+                
+                # Find free block IDs!
+                total_blocks = self.cache_config.num_gpu_blocks
+                allocated_ids = set()
+                for r_idx in range(self.input_batch.num_reqs):
+                    ids = self.input_batch.block_table[0].get_cpu_tensor()[r_idx]
+                    for b in ids:
+                        if b > 0:
+                            allocated_ids.add(int(b))
+                            
+                free_ids = []
+                for b in range(1, total_blocks):
+                    if b not in allocated_ids:
+                        free_ids.append(b)
+                        if len(free_ids) == beam_width:
+                            break
+                            
+                assert len(free_ids) == beam_width, f"Could not find {beam_width} free blocks! Found {len(free_ids)}"
+                
+                # Build cur_block_tables of shape (32, max_blocks)!
+                cur_block_tables_np = np.zeros((32, self.max_num_blocks_per_req), dtype=np.int32)
+                cur_block_tables_np[0] = beam_0_block_ids
+                
+                for b in range(1, beam_width):
+                    beam_b_blocks = np.copy(beam_0_block_ids)
+                    zeros = np.where(beam_b_blocks == 0)[0]
+                    if len(zeros) > 0:
+                        beam_b_blocks[zeros[0]] = free_ids[b]
+                    cur_block_tables_np[b] = beam_b_blocks
+                    
+                cur_block_tables = device_array(self.mesh, cur_block_tables_np, sharding=attn_metadata.block_tables.sharding)
+                
+                cur_positions_np = np.zeros((32,), dtype=np.int32)
+                cur_positions_np[:beam_width] = np.repeat(np.asarray(attn_metadata.input_positions)[-1:], beam_width) + 1
+                cur_positions = device_array(self.mesh, cur_positions_np, sharding=attn_metadata.input_positions.sharding)
+                
+                cur_seq_lens_np = np.zeros((32,), dtype=np.int32)
+                cur_seq_lens_np[:beam_width] = np.repeat(np.asarray(attn_metadata.seq_lens)[0:1], beam_width) + 1
+                cur_seq_lens = device_array(self.mesh, cur_seq_lens_np, sharding=attn_metadata.seq_lens.sharding)
+                
+                cur_query_start_loc = jnp.arange(0, 33, dtype=jnp.int32)
+                cur_request_distribution = jnp.array([32, 32, 32], dtype=jnp.int32)
+                
+                cur_input_ids = jnp.zeros((32, 1), dtype=input_ids.dtype)
+                cur_input_ids = cur_input_ids.at[:beam_width].set(device_array(self.mesh, cur_input_ids_np, sharding=input_ids.sharding))
+                
+            else:
+                # During Decode, input_ids is already shape (1,)!
+                # So we can repeat it safely!
+                cur_block_tables = attn_metadata.block_tables
+                cur_query_start_loc = attn_metadata.query_start_loc
+                cur_request_distribution = attn_metadata.request_distribution
+                
+                cur_input_ids = jnp.zeros((32, 1), dtype=input_ids.dtype)
+                cur_input_ids = cur_input_ids.at[:beam_width].set(jnp.repeat(input_ids, beam_width, axis=0))
+                
+                cur_positions = attn_metadata.input_positions
+                cur_seq_lens = attn_metadata.seq_lens
             
             all_tokens = []
             all_logprobs_token_ids = []
             all_logprobs_scores = []
             all_ranks = []
             
-            cur_input_ids = input_ids
-            cur_positions = attn_metadata.input_positions
-            cur_seq_lens = attn_metadata.seq_lens
-            
-            logits_step = logits.astype(jnp.float32)
+            logits_step = logits.astype(jnp.float32)[:beam_width]
             
             # Step 0: Initial branching!
             first_beam_logits = logits_step[0]
@@ -982,30 +1069,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             top30_logprobs = logits_cpu[top30_token_ids]
             
             next_tokens_cpu = top30_token_ids.reshape(beam_width, 1)
-            next_tokens = device_array(self.mesh, next_tokens_cpu, sharding=tpu_sampling_metadata.temperature.sharding)
-            cum_logprobs = device_array(self.mesh, top30_logprobs, sharding=tpu_sampling_metadata.temperature.sharding)
+            next_tokens = device_array(self.mesh, next_tokens_cpu, sharding=input_ids.sharding)
+            cum_logprobs = device_array(self.mesh, top30_logprobs, sharding=input_ids.sharding)
             
             all_tokens.append(next_tokens)
             
-            step_logprobs = self._compute_and_gather_logprobs(logits_step, next_tokens, self.model_config.max_logprobs)
+            step_logprobs = self._compute_and_gather_logprobs(logits_step, next_tokens.ravel(), self.model_config.max_logprobs)
             all_logprobs_token_ids.append(step_logprobs.logprob_token_ids)
             all_logprobs_scores.append(step_logprobs.logprobs)
             all_ranks.append(step_logprobs.selected_token_ranks)
             
             lora_metadata = self.lora_utils.extract_lora_metadata()
-            block_tables_2d = attn_metadata.block_tables.reshape(beam_width, -1)
             
             for step in range(1, max_tokens):
-                cur_input_ids = next_tokens
+                cur_input_ids_32 = jnp.zeros((32, 1), dtype=next_tokens.dtype)
+                cur_input_ids_32 = cur_input_ids_32.at[:beam_width].set(next_tokens)
+                
                 cur_positions = cur_positions + 1
                 cur_seq_lens = cur_seq_lens + 1
                 
+                cur_block_tables_1d = cur_block_tables.reshape(-1)
+                
                 step_attn_metadata = AttentionMetadata(
                     input_positions=cur_positions,
-                    block_tables=attn_metadata.block_tables,
+                    block_tables=cur_block_tables_1d,
                     seq_lens=cur_seq_lens,
-                    query_start_loc=attn_metadata.query_start_loc,
-                    request_distribution=attn_metadata.request_distribution
+                    query_start_loc=cur_query_start_loc,
+                    request_distribution=cur_request_distribution
                 )
                 
                 self.rng_params_for_sampling, step_rng = jax.random.split(self.rng_params_for_sampling)
@@ -1013,7 +1103,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 (self.kv_caches, hidden_states, _) = self.model_fn(
                     self.state,
                     self.kv_caches,
-                    cur_input_ids,
+                    cur_input_ids_32.ravel(),
                     step_attn_metadata,
                     None,
                     cur_positions,
@@ -1024,9 +1114,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.is_last_rank,
                 )
                 
-                hidden_states = self._select_from_array_fn(hidden_states, logits_indices)
+                cur_logits_indices = jnp.zeros((32,), dtype=jnp.int32)
+                hidden_states = self._select_from_array_fn(hidden_states, cur_logits_indices)
                 logits_step = self.compute_logits_fn(self.state, hidden_states, lora_metadata)
-                logits_step = logits_step.astype(jnp.float32)
+                logits_step = logits_step.astype(jnp.float32)[:beam_width]
                 
                 logprobs_step = jax.nn.log_softmax(logits_step, axis=-1)
                 total_logprobs = logprobs_step + cum_logprobs[:, None]
@@ -1038,17 +1129,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 parent_beam_ids = top_indices // vocab_size
                 token_ids = top_indices % vocab_size
                 
+                
+                # Shuffle token history to match surviving parent beams!
+                for prev_step in range(len(all_tokens)):
+                    all_tokens[prev_step] = all_tokens[prev_step][parent_beam_ids]
+                
                 next_tokens = token_ids.reshape(beam_width, 1)
                 all_tokens.append(next_tokens)
                 
                 cum_logprobs = top_scores
                 
-                step_logprobs = self._compute_and_gather_logprobs(logits_step, next_tokens, self.model_config.max_logprobs)
-                all_logprobs_token_ids.append(step_logprobs.logprob_token_ids)
-                all_logprobs_scores.append(step_logprobs.logprobs)
-                all_ranks.append(step_logprobs.selected_token_ranks)
-                
-                self.kv_caches = _shuffle_kv_caches(self.kv_caches, parent_beam_ids, block_tables_2d, beam_width)
+            step_logprobs = self._compute_and_gather_logprobs(logits_step, next_tokens.ravel(), self.model_config.max_logprobs)
+            all_logprobs_token_ids.append(step_logprobs.logprob_token_ids)
+            all_logprobs_scores.append(step_logprobs.logprobs)
+            all_ranks.append(step_logprobs.selected_token_ranks)
+            
+            self.kv_caches = _shuffle_kv_caches(self.kv_caches, parent_beam_ids, cur_block_tables, beam_width)
                 
             next_tokens = jnp.concatenate(all_tokens, axis=-1)
             
@@ -1773,8 +1869,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         num_scheduled_tokens_per_req = np.array(num_scheduled_tokens_per_req,
                                                 dtype=np.int32)
         assert max_num_scheduled_tokens_all_reqs > 0
-        padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs)
+        first_req_id = self.input_batch.req_ids[0]
+        first_req_state = self.requests[first_req_id]
+        use_beam_search = first_req_state.sampling_params.use_beam_search if first_req_state.sampling_params else False
+
+        if use_beam_search:
+            padded_num_reqs = 32
+        else:
+            padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
+                num_reqs, self.max_num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
