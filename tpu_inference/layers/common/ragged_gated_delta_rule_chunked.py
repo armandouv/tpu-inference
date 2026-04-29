@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ragged gated delta rule packed JAX implementation."""
+"""Ragged gated delta rule packed JAX implementation.
+
+Several call sites here run in fp32 to match GPU FLA's precision
+(``vllm/model_executor/layers/fla/ops/{fused_sigmoid_gating,l2norm}.py``
+and ``vllm/model_executor/layers/mamba/gdn_linear_attn.py``). See PR
+#2408 for the ablation that ties this to Qwen3.5-397B GPQA-Diamond.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -23,17 +29,22 @@ import tpu_inference.kernels.gdn.triangle_solver as triangle_solver
 def l2norm(x: jnp.ndarray, dim: int = -1, eps: float = 1e-6) -> jnp.ndarray:
     """Normalizes x along the specified dimension using L2 norm.
 
-    Args:
-      x: Input array.
-      dim: Dimension along which to normalize.
-      eps: Epsilon value to avoid division by zero.
+  Sum-of-squares and rsqrt run in fp32 even when ``x`` is bf16, to
+  match GPU FLA's ``l2norm_fwd``
+  (`vllm/model_executor/layers/fla/ops/l2norm.py`).
 
-    Returns:
-      Normalized array.
-    """
-    inv_norm = jax.lax.rsqrt((x * x).sum(axis=dim, keepdims=True) +
-                             jnp.array(eps, dtype=x.dtype))
-    return x * inv_norm
+  Args:
+    x: Input array.
+    dim: Dimension along which to normalize.
+    eps: Epsilon value to avoid division by zero.
+
+  Returns:
+    Normalized array, in the same dtype as ``x``.
+  """
+    x_f32 = x.astype(jnp.float32)
+    inv_norm = jax.lax.rsqrt((x_f32 * x_f32).sum(axis=dim, keepdims=True) +
+                             eps)
+    return (x_f32 * inv_norm).astype(x.dtype)
 
 
 def pack_inputs_single_stream(
@@ -91,7 +102,8 @@ def pack_inputs_single_stream(
       g: Gate tensor.
       beta: Beta tensor.
       query_start_loc: Start locations of each sequence in original stream.
-      distribution: Tensor of shape `(3,)` int32 — `(decode_end, prefill_end, mixed_end)`.
+      distribution: Distribution tensor containing number of valid sequences at
+        index 2.
       chunk_size: Chunk size for padding.
       compute_dtype: Dtype for computation (Q, K, V, beta).
 
@@ -198,11 +210,14 @@ def ragged_gated_delta_rule_mixed_prefill(
     recurrent_state: jnp.ndarray,
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
+    has_initial_state: jnp.ndarray,
     chunk_size: int = 64,
     use_qk_norm_in_gdn: bool = False,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     precision: jax.lax.Precision = jax.lax.Precision.HIGHEST,
     preferred_element_type: jnp.dtype = jnp.float32,
+    triangle_solver_impl: triangle_solver.TriangleSolverImpl = triangle_solver.
+    TriangleSolverImpl.GAUSSIAN,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies chunked gated delta rule for mixed prefill case.
 
@@ -220,23 +235,37 @@ def ragged_gated_delta_rule_mixed_prefill(
       A_log: A_log tensor.
       dt_bias: dt_bias tensor.
       query_start_loc: Start locations of sequences in original stream.
-      recurrent_state: Recurrent state tensor.
+      recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
+        d_v)`. `num_blocks` is always equal or larger than `max_seqs + 1`. The
+        first block is a null_block and only used for padded / invalid tokens.
       state_indices: Indices mapping sequences to recurrent state slots.
-      distribution: Tensor of shape `(3,)` int32 — `(decode_end, prefill_end, mixed_end)`.
+      distribution: Distribution tensor containing number of valid sequences at
+        index 2.
+      has_initial_state: Boolean tensor of shape `(max_reqs,)`. ``True`` when
+        the request has prior recurrent state to use (chunked-prefill
+        continuation or prefix-cache hit). ``False`` for brand-new prefills,
+        in which case the gathered recurrent state is treated as zeros —
+        matching GPU's `initial_state[~has_initial_state, ...] = 0` in
+        `gdn_linear_attn._forward_core`.
       chunk_size: Chunk size for padding and processing.
       use_qk_norm_in_gdn: Whether to use QK normalization.
       compute_dtype: Dtype for computation.
       precision: Precision for matrix multiplication.
       preferred_element_type: Preferred element type for matrix multiplication.
+      triangle_solver_impl: Which triangle solver implementation to use.
 
     Returns:
       A tuple containing:
-        - updated_recurrent_state: Updated recurrent state tensor.
+        - updated_recurrent_state: Updated recurrent state tensor of shape
+          `(num_blocks, n_v, d_k, d_v)`.
         - output: Output tensor.
     """
     initial_dtype = query.dtype
 
-    beta = jax.nn.sigmoid(b_reshaped)
+    # Cast b to fp32 before sigmoid to match GPU's
+    # `fused_gdn_gating_kernel`
+    # (`vllm/model_executor/layers/mamba/gdn_linear_attn.py`).
+    beta = jax.nn.sigmoid(b_reshaped.astype(jnp.float32))
     g = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
         a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32))
 
@@ -309,8 +338,7 @@ def ragged_gated_delta_rule_mixed_prefill(
 
     identity = jnp.eye(chunk_size, dtype=jnp.float32)
 
-    A = triangle_solver.decompose_triangular_matrix_inverse_pallas(identity +
-                                                                   S)
+    A = triangle_solver_impl(identity + S)
 
     v_beta = v_c * beta_c[..., None]
     u_chunks = jnp.matmul(
@@ -363,6 +391,14 @@ def ragged_gated_delta_rule_mixed_prefill(
                                  dtype=recurrent_state.dtype)
     start_chunk_indices = new_query_start_loc[:-1] // chunk_size
     init_states_for_seqs = recurrent_state[state_indices]
+    # For brand-new prefills (no prior context), use zero initial state
+    # rather than whatever a reused mamba slot still held. Matches GPU's
+    # `initial_state[~has_initial_state, ...] = 0`.
+    init_states_for_seqs = jnp.where(
+        has_initial_state[:, None, None, None],
+        init_states_for_seqs,
+        jnp.zeros_like(init_states_for_seqs),
+    )
     init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(
         init_states_for_seqs)
 
@@ -433,8 +469,17 @@ def ragged_gated_delta_rule_mixed_prefill(
     # Update recurrent state
     last_chunk_indices = (new_query_start_loc[1:] // chunk_size) - 1
     final_states = h_chunks[last_chunk_indices]
+
+    num_seqs = last_chunk_indices.shape[0]
+    valid_seq_mask = jnp.arange(num_seqs) < distribution[2]
+    current_states = recurrent_state[state_indices]
+    states_to_set = jnp.where(
+        valid_seq_mask[:, None, None, None],
+        final_states.astype(recurrent_state.dtype),
+        current_states,
+    )
     updated_recurrent_state = recurrent_state.at[state_indices].set(
-        final_states.astype(recurrent_state.dtype))
+        states_to_set)
 
     return updated_recurrent_state, output
 
@@ -451,20 +496,40 @@ def recurrent_gated_delta_rule_step(
     B, H, d_k = query.shape
     d_v = value.shape[-1]
 
+    # Run in fp32 to match GPU FLA's
+    # `fused_sigmoid_gating_delta_rule_update` kernel, which loads
+    # q/k/v/state as fp32 and keeps the recurrent update in fp32
+    # registers.
+    orig_dtype = query.dtype
+    query = query.astype(jnp.float32)
+    key = key.astype(jnp.float32)
+    value = value.astype(jnp.float32)
+    beta = beta.astype(jnp.float32)
+    g = g.astype(jnp.float32)
     if state is None:
-        state = jnp.zeros((B, H, d_k, d_v), dtype=query.dtype)
+        state = jnp.zeros((B, H, d_k, d_v), dtype=jnp.float32)
+    else:
+        state = state.astype(jnp.float32)
 
     scale = d_k**-0.5
     query = query * scale
 
     exp_g = jnp.exp(g)
 
-    k_state = jnp.einsum("bhd, bhdm -> bhm", key, state)
+    # `Precision.HIGHEST` is required even with fp32 inputs: TPU MXU's
+    # default mode downconverts fp32 operands to bf16 before multiply.
+    k_state = jnp.einsum("bhd, bhdm -> bhm",
+                         key,
+                         state,
+                         precision=jax.lax.Precision.HIGHEST)
     v_diff = value - exp_g[..., None] * k_state
 
     v_new = beta[..., None] * v_diff
 
-    q_state = jnp.einsum("bhd, bhdm -> bhm", query, state)
+    q_state = jnp.einsum("bhd, bhdm -> bhm",
+                         query,
+                         state,
+                         precision=jax.lax.Precision.HIGHEST)
     q_k = jnp.sum(query * key, axis=-1, keepdims=True)
 
     out = exp_g[..., None] * q_state + q_k * v_new
@@ -473,7 +538,7 @@ def recurrent_gated_delta_rule_step(
     k_v_new = key[..., :, None] * v_new[..., None, :]
     new_state = state * exp_g[..., None, None] + k_v_new
 
-    return out, new_state
+    return out.astype(orig_dtype), new_state
 
 
 def ragged_gated_delta_rule_decode_only(
@@ -498,28 +563,34 @@ def ragged_gated_delta_rule_decode_only(
       value: Value tensor.
       b_reshaped: Reshaped b tensor (for beta).
       a_reshaped: Reshaped a tensor (for g).
-      recurrent_state: Recurrent state tensor.
+      recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
+        d_v)`. `num_blocks` is always equal or larger than `max_seqs + 1`. The
+        first block is a null_block and only used for padded / invalid tokens.
       A_log: A_log tensor.
       dt_bias: dt_bias tensor.
       query_start_loc: Start locations of sequences.
       state_indices: Indices mapping sequences to recurrent state slots.
-      distribution: Distribution tensor containing number of valid sequences at index 2.
+      distribution: Distribution tensor containing number of valid sequences at
+        index 2.
       use_qk_norm_in_gdn: Whether to use QK normalization.
 
     Returns:
       A tuple containing:
-        - updated_recurrent_state: Updated recurrent state tensor.
+        - updated_recurrent_state: Updated recurrent state tensor of shape
+          `(num_blocks, n_v, d_k, d_v)`.
         - output: Output tensor.
     """
     num_tokens = query.shape[0]
     max_reqs = recurrent_state.shape[0]
 
     token_idx = jnp.arange(num_tokens)
-    req_indices = token_idx
-    req_indices = jnp.clip(req_indices, 0, max_reqs - 1)
+    req_indices = jnp.clip(token_idx, 0, max_reqs - 1)
     valid_mask = token_idx < distribution[2]
 
-    beta = jax.nn.sigmoid(b_reshaped)
+    # See comment on the same expression in
+    # `ragged_gated_delta_rule_mixed_prefill` for why sigmoid runs in
+    # fp32.
+    beta = jax.nn.sigmoid(b_reshaped.astype(jnp.float32))
     g = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
         a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32))
 
@@ -527,37 +598,47 @@ def ragged_gated_delta_rule_decode_only(
         query = l2norm(query)
         key = l2norm(key)
 
+    # Gather the current states for the requests in this batch
     req_state_indices = state_indices[req_indices]
-    curr_states = recurrent_state[req_state_indices]
+    current_states = recurrent_state[req_state_indices]
 
+    # Call step function directly with the inputs (no scattering needed)
     outputs, new_states = recurrent_gated_delta_rule_step(
         query,
         key,
         value,
         g,
         beta,
-        state=curr_states,
+        state=current_states,
     )
 
+    # Mask outputs for invalid tokens
+    outputs = jnp.where(valid_mask[:, None, None], outputs, 0.0)
     outputs = outputs.reshape(num_tokens, -1)
 
-    dummy_idx = max_reqs
-    recurrent_state_padded = jnp.pad(
-        recurrent_state,
-        ((0, 1), (0, 0), (0, 0), (0, 0)),
-        mode="constant",
-        constant_values=0,
-    )
+    # Mask state for invalid tokens
+    states_to_set = jnp.where(valid_mask[:, None, None, None], new_states,
+                              current_states)
 
-    safe_indices = jnp.where(valid_mask, req_state_indices, dummy_idx)
-    updated_recurrent_state_padded = recurrent_state_padded.at[
-        safe_indices].set(new_states.astype(recurrent_state.dtype))
+    updated_recurrent_state = recurrent_state.at[req_state_indices].set(
+        states_to_set)
 
-    new_recurrent_state = updated_recurrent_state_padded[:max_reqs]
-
-    return new_recurrent_state, outputs
+    return updated_recurrent_state.astype(recurrent_state.dtype), outputs
 
 
+# Donate conv_state to avoid "copy" op by XLA
+@jax.jit(
+    donate_argnames=('recurrent_state', ),
+    static_argnames=(
+        'n_kq',
+        'n_v',
+        'd_k',
+        'd_v',
+        'chunk_size',
+        'use_qk_norm_in_gdn',
+    ),
+)
+@jax.named_scope("ragged_gated_delta_rule_chunked")
 def ragged_gated_delta_rule(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -568,6 +649,7 @@ def ragged_gated_delta_rule(
     query_start_loc: jnp.ndarray,
     state_indices: jnp.ndarray,
     distribution: jnp.ndarray,
+    has_initial_state: jnp.ndarray,
     *,
     n_kq: int,
     n_v: int,
@@ -586,12 +668,19 @@ def ragged_gated_delta_rule(
       mixed_qkv: Mixed query, key, value tensor.
       b: b tensor (for beta).
       a: a tensor (for g).
-      recurrent_state: Recurrent state tensor.
+      recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
+        d_v)`. `num_blocks` is always equal or larger than `max_seqs + 1`. The
+        first block is a null_block and only used for padded / invalid tokens.
       A_log: A_log tensor.
       dt_bias: dt_bias tensor.
       query_start_loc: Start locations of sequences.
       state_indices: Indices mapping sequences to recurrent state slots.
-      distribution: Tensor of shape `(3,)` int32 — `(decode_end, prefill_end, mixed_end)`.
+      distribution: Tensor of shape `(3,)` int32 — `(decode_end, prefill_end,
+        mixed_end)`.
+      has_initial_state: Boolean tensor of shape `(max_reqs,)` indicating
+        which sequences have a valid prior recurrent state in their slot.
+        Forwarded to the prefill branch; the decode branch ignores it
+        because decodes always continue from the running state.
       n_kq: Number of key/query heads.
       n_v: Number of value heads.
       d_k: Key/query dimension.
@@ -601,7 +690,8 @@ def ragged_gated_delta_rule(
 
     Returns:
       A tuple containing:
-        - updated_recurrent_state: Updated recurrent state tensor.
+        - updated_recurrent_state: Updated recurrent state tensor of shape
+          `(num_blocks, n_v, d_k, d_v)`.
         - output: Output tensor.
     """
     num_tokens = mixed_qkv.shape[0]
@@ -651,6 +741,7 @@ def ragged_gated_delta_rule(
             recurrent_state=recurrent_state,
             state_indices=state_indices,
             distribution=distribution,
+            has_initial_state=has_initial_state,
             chunk_size=chunk_size,
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
         )
