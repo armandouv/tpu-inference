@@ -1946,8 +1946,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Do the padding and copy the tensors to the TPU.
         padded_total_num_scheduled_tokens = runner_utils.get_padded_token_len(
             self.num_tokens_paddings, total_num_scheduled_tokens)
-        padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs)
+        first_req_id = self.input_batch.req_ids[0]
+        first_req_state = self.requests[first_req_id]
+        use_beam_search = first_req_state.sampling_params.use_beam_search if first_req_state.sampling_params else False
+
+        if use_beam_search:
+            padded_num_reqs = 32
+        else:
+            padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
+                num_reqs, self.max_num_reqs)
 
         # Please see runner_utils.PhasedBasedProfiler for details
         if self.phase_based_profiler:
