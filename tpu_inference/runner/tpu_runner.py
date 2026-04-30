@@ -196,7 +196,8 @@ def _native_beam_search_loop_jit(
             None, is_first_rank, is_last_rank
         )
         
-        cur_logits_indices = jnp.zeros((32,), dtype=jnp.int32)
+        cur_logits_indices = jnp.arange(32, dtype=jnp.int32)
+        cur_logits_indices = jnp.where(cur_logits_indices < beam_width, cur_logits_indices, 0)
         hidden_states = select_from_array_fn(hidden_states, cur_logits_indices)
         logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
@@ -211,6 +212,12 @@ def _native_beam_search_loop_jit(
         all_logprobs_token_ids = all_logprobs_token_ids.at[step].set(step_logprobs.logprob_token_ids)
         all_logprobs_scores = all_logprobs_scores.at[step].set(step_logprobs.logprobs)
         all_ranks = all_ranks.at[step].set(step_logprobs.selected_token_ranks)
+        
+        # Shuffle output sequence histories across columns according to parent_beam_ids!
+        all_tokens = all_tokens.at[:step].set(all_tokens[:step, parent_beam_ids])
+        all_logprobs_token_ids = all_logprobs_token_ids.at[:step].set(all_logprobs_token_ids[:step, parent_beam_ids])
+        all_logprobs_scores = all_logprobs_scores.at[:step].set(all_logprobs_scores[:step, parent_beam_ids])
+        all_ranks = all_ranks.at[:step].set(all_ranks[:step, parent_beam_ids])
         
         # We don't need to shuffle the kv-caches on the last step
         if step < max_tokens - 1:
@@ -1101,7 +1108,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             assert num_reqs == 1, f"Expected 1 request in batch for beam search, got {num_reqs}!"
             first_req_id = req_ids[0]
             first_req_state = self.requests[first_req_id]
-            beam_width = getattr(first_req_state.sampling_params, "best_of", 30) if first_req_state.sampling_params else 30
+            
+            import os
+            beam_width = 30
+            if first_req_state.sampling_params and first_req_state.sampling_params.extra_args:
+                beam_width = first_req_state.sampling_params.extra_args.get("beam_width", beam_width)
+            elif "VLLM_BEAM_WIDTH" in os.environ:
+                beam_width = int(os.environ["VLLM_BEAM_WIDTH"])
             max_tokens = first_req_state.sampling_params.max_tokens if first_req_state.sampling_params else 4
             logger.info(f"DEBUG: Running beam search loop for {max_tokens} tokens")
             
@@ -1206,7 +1219,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 all_logprobs_scores.append(jitted_logprobs_scores[step])
                 all_ranks.append(jitted_ranks[step])
                 
-            next_tokens = jnp.concatenate(all_tokens, axis=-1)
+            next_tokens = jnp.stack(all_tokens, axis=-1).squeeze(axis=1)
             
             final_logprobs_token_ids = jnp.concatenate(all_logprobs_token_ids, axis=0)
             final_logprobs_scores = jnp.concatenate(all_logprobs_scores, axis=0)
