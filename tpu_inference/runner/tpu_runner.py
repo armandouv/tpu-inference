@@ -119,6 +119,23 @@ def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width, 
     return [shuffle_layer(c) for c in kv_caches]
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 
+@jax.jit(static_argnames=("beam_width",))
+def _select_next_beams(logits_step, cum_logprobs, beam_width):
+    logprobs_step = jax.nn.log_softmax(logits_step, axis=-1)
+    total_logprobs = logprobs_step + cum_logprobs[:, None]
+    
+    # Optimize top-k by searching in two stages
+    top_scores_per_beam, top_indices_per_beam = jax.lax.top_k(total_logprobs, k=beam_width)
+    flat_scores = top_scores_per_beam.ravel()
+    flat_indices = top_indices_per_beam.ravel()
+    
+    top_scores, global_top_indices = jax.lax.top_k(flat_scores, k=beam_width)
+    
+    parent_beam_ids = global_top_indices // beam_width
+    token_ids = flat_indices[global_top_indices]
+    
+    return parent_beam_ids, token_ids, top_scores
+
 @functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 19, 20, 21, 22), donate_argnums=(10,))
 def _native_beam_search_loop_jit(
     model_fn, compute_logits_fn, select_from_array_fn, compute_and_gather_logprobs_fn,
@@ -167,21 +184,8 @@ def _native_beam_search_loop_jit(
         logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
         
-        logprobs_step = jax.nn.log_softmax(logits_step, axis=-1)
-        total_logprobs = logprobs_step + cum_logprobs[:, None]
-        
-        # Optimize top-k by searching in two stages
-        top_scores_per_beam, top_indices_per_beam = jax.lax.top_k(total_logprobs, k=beam_width)
-        flat_scores = top_scores_per_beam.ravel()
-        flat_indices = top_indices_per_beam.ravel()
-        
-        top_scores, global_top_indices = jax.lax.top_k(flat_scores, k=beam_width)
-        
-        parent_beam_ids = global_top_indices // beam_width
-        token_ids = flat_indices[global_top_indices]
-        
+        parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs, beam_width)
         next_tokens = token_ids.reshape(beam_width, 1)
-        cum_logprobs = top_scores
         
         step_logprobs = compute_and_gather_logprobs_fn(logits_step, next_tokens.ravel(), max_logprobs)
         
