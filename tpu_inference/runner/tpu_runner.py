@@ -1082,10 +1082,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if tpu_sampling_metadata.use_beam_search:
             logger.info(f"DEBUG: Entering Native Beam Search loop. Batch size={num_reqs}, Requests={req_ids}")
             assert num_reqs == 1, f"Expected 1 request in batch for beam search, got {num_reqs}!"
-            beam_width = 30
-            
             first_req_id = req_ids[0]
             first_req_state = self.requests[first_req_id]
+            beam_width = getattr(first_req_state.sampling_params, "best_of", 30) if first_req_state.sampling_params else 30
             max_tokens = first_req_state.sampling_params.max_tokens if first_req_state.sampling_params else 4
             logger.info(f"DEBUG: Running beam search loop for {max_tokens} tokens")
             
