@@ -121,6 +121,18 @@ from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 
 @jax.jit(static_argnames=("beam_width",))
 def _select_next_beams(logits_step, cum_logprobs, beam_width):
+    """Selects the top-k candidates across all beams.
+
+    Args:
+        logits_step: Logits for the current step, shape (beam_width, vocab_size).
+        cum_logprobs: Cumulative logprobs for the current beams, shape (beam_width,).
+        beam_width: Number of beams to maintain.
+
+    Returns:
+        parent_beam_ids: Indices of parent beams for the selected candidates, shape (beam_width,).
+        token_ids: Token IDs for the selected candidates, shape (beam_width,).
+        top_scores: Updated cumulative logprobs for the selected candidates, shape (beam_width,).
+    """
     logprobs_step = jax.nn.log_softmax(logits_step, axis=-1)
     total_logprobs = logprobs_step + cum_logprobs[:, None]
     
@@ -147,6 +159,11 @@ def _native_beam_search_loop_jit(
     is_first_rank, is_last_rank, layer_name_to_kvcache_index,
     start_block_idx
 ):
+    """Executes the autoregressive decoding loop for beam search on TPU.
+
+    This function runs the full generation loop on-device to avoid host-device
+    round trips. It shuffles KV caches at each step to maintain beam history.
+    """
     # Pre-allocate arrays for outputs!
     all_tokens = jnp.zeros((max_tokens, beam_width, 1), dtype=next_tokens.dtype)
     all_logprobs_token_ids = jnp.zeros((max_tokens, beam_width, max_logprobs + 1), dtype=jnp.int32)
