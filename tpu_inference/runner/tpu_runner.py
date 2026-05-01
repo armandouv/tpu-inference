@@ -99,29 +99,18 @@ import functools
 # Analyze what we are actually doing and if we can make it run faster. In the trace I see a np.asarray and
 # an argsort in the gap. Where do these come from and can we just keep execution on device?
 # 2. Is it possible that we jit as many things together as possible? Maybe the whole decoding loop.
-def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width, start_block_idx, step):
-    def shuffle_layer(kv_cache):
-        for b_idx in range(beam_width):
-            p_b_idx = parent_beam_ids[b_idx]
-            child_blocks = block_tables_2d[b_idx, start_block_idx : start_block_idx + step]
-            parent_blocks = block_tables_2d[p_b_idx, start_block_idx : start_block_idx + step]
-            
-            # Extract to small temp buffer to avoid hazard!
-            temp_data = kv_cache[parent_blocks]
-            kv_cache = kv_cache.at[child_blocks].set(temp_data)
-        return kv_cache
-    
-    return [shuffle_layer(c) for c in kv_caches]
+# KV cache shuffling removed in favor of block table sharing!
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 
-@jax.jit(static_argnames=("beam_width",))
-def _select_next_beams(logits_step, cum_logprobs, beam_width):
+@jax.jit(static_argnames=("beam_width", "pad_token_id"))
+def _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id):
     """Selects the top-k candidates across all beams.
 
     Args:
         logits_step: Logits for the current step, shape (beam_width, vocab_size).
         cum_logprobs: Cumulative logprobs for the current beams, shape (beam_width,).
         beam_width: Number of beams to maintain.
+        pad_token_id: Token ID to mask out.
 
     Returns:
         parent_beam_ids: Indices of parent beams for the selected candidates, shape (beam_width,).
@@ -141,19 +130,31 @@ def _select_next_beams(logits_step, cum_logprobs, beam_width):
     parent_beam_ids = global_top_indices // (2 * beam_width)
     token_ids = flat_indices[global_top_indices]
     
+    # Debug prints!
+    jax.debug.print("top_scores: {}", top_scores)
+    jax.debug.print("global_top_indices: {}", global_top_indices)
+    jax.debug.print("parent_beam_ids: {}", parent_beam_ids)
+    jax.debug.print("token_ids: {}", token_ids)
+    
+    # Print top candidates before top_k!
+    top5_scores, top5_indices = jax.lax.top_k(flat_scores, k=5)
+    jax.debug.print("top5_flat_scores: {}", top5_scores)
+    jax.debug.print("top5_flat_indices: {}", top5_indices)
+    
+    return parent_beam_ids, token_ids, top_scores
+    
     return parent_beam_ids, token_ids, top_scores
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 22, 23, 24, 25), donate_argnums=(10,))
+@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 21, 22, 23, 24, 25), donate_argnums=(9, 17))
 def _native_beam_search_loop_jit(
     model_fn, compute_logits_fn, select_from_array_fn, compute_and_gather_logprobs_fn,
-    _shuffle_kv_caches,
     max_tokens, beam_width, vocab_size, max_logprobs,
     state, kv_caches, next_tokens, cum_logprobs,
     step0_logprobs_token_ids, step0_logprobs_scores, step0_ranks,
     cur_positions, cur_seq_lens, cur_block_tables,
     cur_query_start_loc, cur_request_distribution, lora_metadata,
     is_first_rank, is_last_rank, layer_name_to_kvcache_index,
-    start_block_idx
+    start_block_idx, pad_token_id
 ):
     """Executes the autoregressive decoding loop for beam search on TPU.
 
@@ -204,10 +205,14 @@ def _native_beam_search_loop_jit(
         logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
         
-        parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs, beam_width)
+        parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id)
         next_tokens = token_ids.reshape(beam_width, 1)
         
         step_logprobs = compute_and_gather_logprobs_fn(logits_step, next_tokens.ravel(), max_logprobs)
+        
+        # Debug prints for token logprobs!
+        jax.debug.print("step_token_logprobs: {}", step_logprobs.logprobs)
+        jax.debug.print("cum_logprobs: {}", cum_logprobs)
         
         # Update outputs!
         all_tokens = all_tokens.at[step].set(next_tokens)
@@ -218,9 +223,9 @@ def _native_beam_search_loop_jit(
         # Shuffle output sequence histories across columns according to parent_beam_ids!
         all_tokens = all_tokens.at[:step].set(all_tokens[:step, parent_beam_ids])
         all_logprobs_token_ids = all_logprobs_token_ids.at[:step].set(all_logprobs_token_ids[:step, parent_beam_ids])
-        # We don't need to shuffle the kv-caches on the last step
+        # Shuffle block tables instead of KV caches!
         if step < max_tokens - 1:
-            kv_caches = _shuffle_kv_caches(kv_caches, parent_beam_ids, cur_block_tables, beam_width, start_block_idx, step)
+            cur_block_tables = cur_block_tables.at[:beam_width, :start_block_idx + step].set(cur_block_tables[parent_beam_ids, :start_block_idx + step])
             
     return kv_caches, all_tokens, all_logprobs_token_ids, all_logprobs_scores, all_ranks
 from tpu_inference.utils import (device_array, make_optimized_mesh,
@@ -1143,7 +1148,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             # Fast way to find free block IDs without full search loop
             max_allocated_id = np.max(beam_0_block_ids)
-            free_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + beam_width + 1))
+            # Allocate max_tokens blocks per beam!
+            free_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + beam_width * max_tokens))
             
             # Build cur_block_tables of shape (32, max_blocks)!
             cur_block_tables_np = np.zeros((32, self.max_num_blocks_per_req), dtype=np.int32)
@@ -1152,7 +1158,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 beam_b_blocks = np.copy(beam_0_block_ids)
                 zeros = np.where(beam_b_blocks == 0)[0]
                 if len(zeros) > 0:
-                    beam_b_blocks[zeros[0]] = free_ids[b]
+                    for s in range(max_tokens):
+                        if zeros[0] + s < self.max_num_blocks_per_req:
+                            beam_b_blocks[zeros[0] + s] = free_ids[b * max_tokens + s]
                 cur_block_tables_np[b] = beam_b_blocks
                 
             zeros_0 = np.where(beam_0_block_ids == 0)[0]
@@ -1183,7 +1191,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             # Step 0: Initial branching!
             first_beam_logits = logits_step[0]
-            top30_logprobs, top30_token_ids = jax.lax.top_k(first_beam_logits, beam_width)
+            first_beam_logprobs = jax.nn.log_softmax(first_beam_logits, axis=-1)
+            top30_logprobs, top30_token_ids = jax.lax.top_k(first_beam_logprobs, beam_width)
             
             next_tokens = top30_token_ids.reshape(beam_width, 1)
             cum_logprobs = top30_logprobs
@@ -1193,16 +1202,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             lora_metadata = self.lora_utils.extract_lora_metadata()
             vocab_size = logits_step.shape[-1]
 
+            # Extract pad_token_id programmatically!
+            pad_token_id = getattr(self.model_config.hf_config, "pad_token_id", None)
+            if pad_token_id is None:
+                pad_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
+            if pad_token_id is None:
+                pad_token_id = 0 # Fallback to 0 if both are None!
+                
             (self.kv_caches, jitted_tokens, jitted_logprobs_token_ids, jitted_logprobs_scores, jitted_ranks) = _native_beam_search_loop_jit(
                 self.model_fn, self.compute_logits_fn, self._select_from_array_fn, self._compute_and_gather_logprobs,
-                _shuffle_kv_caches,
                 max_tokens, beam_width, vocab_size, self.model_config.max_logprobs,
                 self.state, self.kv_caches, next_tokens, cum_logprobs,
                 step_logprobs.logprob_token_ids, step_logprobs.logprobs, step_logprobs.selected_token_ranks,
                 cur_positions, cur_seq_lens, cur_block_tables,
                 cur_query_start_loc, cur_request_distribution, lora_metadata,
                 self.is_first_rank, self.is_last_rank, tuple(self.layer_name_to_kvcache_index.items()),
-                start_block_idx
+                start_block_idx, pad_token_id
             )
             
             next_tokens = jnp.transpose(jitted_tokens, (1, 0, 2)).squeeze(axis=-1)
