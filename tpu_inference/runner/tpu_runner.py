@@ -245,7 +245,7 @@ def _native_beam_search_loop_jit(
         all_logprobs_token_ids = all_logprobs_token_ids.at[:step].set(all_logprobs_token_ids[:step, parent_beam_ids])
         # Shuffle block tables instead of KV caches!
         if step < max_tokens - 1:
-            cur_block_tables = cur_block_tables.at[:beam_width, :start_block_idx + step + 1].set(cur_block_tables[parent_beam_ids, :start_block_idx + step + 1])
+            cur_block_tables = cur_block_tables.at[:beam_width].set(cur_block_tables[parent_beam_ids])
             
     return kv_caches, all_tokens, all_logprobs_token_ids, all_logprobs_scores, all_ranks
 from tpu_inference.utils import (device_array, make_optimized_mesh,
