@@ -136,6 +136,10 @@ def _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id):
     jax.debug.print("parent_beam_ids: {}", parent_beam_ids)
     jax.debug.print("token_ids: {}", token_ids)
     
+    # Calculate and print individual token logprobs!
+    step_token_logprob = top_scores - cum_logprobs[parent_beam_ids]
+    jax.debug.print("step_token_logprob: {}", step_token_logprob)
+    
     # Print top candidates before top_k!
     top5_scores, top5_indices = jax.lax.top_k(flat_scores, k=5)
     jax.debug.print("top5_flat_scores: {}", top5_scores)
@@ -154,7 +158,7 @@ def _native_beam_search_loop_jit(
     cur_positions, cur_seq_lens, cur_block_tables,
     cur_query_start_loc, cur_request_distribution, lora_metadata,
     is_first_rank, is_last_rank, layer_name_to_kvcache_index,
-    start_block_idx, pad_token_id
+    start_block_idx, pad_token_id, free_ids
 ):
     """Executes the autoregressive decoding loop for beam search on TPU.
 
@@ -206,6 +210,22 @@ def _native_beam_search_loop_jit(
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
         
         parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id)
+        
+        # CoW for generated blocks inside JIT!
+        start_block_idx = cur_seq_lens[0] // 128
+        free_ids_array = jnp.array(free_ids, dtype=jnp.int32).reshape(max_tokens, 32)
+        for b in range(beam_width):
+            p = parent_beam_ids[b]
+            src_block = cur_block_tables[p, start_block_idx]
+            dst_block = free_ids_array[step, b]
+            
+            # Copy KV cache across all layers!
+            for layer_idx in range(len(kv_caches)):
+                kv_caches[layer_idx] = kv_caches[layer_idx].at[dst_block].set(kv_caches[layer_idx][src_block])
+                
+            # Update cur_block_tables for this beam!
+            cur_block_tables = cur_block_tables.at[b, start_block_idx].set(dst_block)
+            
         next_tokens = token_ids.reshape(beam_width, 1)
         
         step_logprobs = compute_and_gather_logprobs_fn(logits_step, next_tokens.ravel(), max_logprobs)
@@ -225,7 +245,7 @@ def _native_beam_search_loop_jit(
         all_logprobs_token_ids = all_logprobs_token_ids.at[:step].set(all_logprobs_token_ids[:step, parent_beam_ids])
         # Shuffle block tables instead of KV caches!
         if step < max_tokens - 1:
-            cur_block_tables = cur_block_tables.at[:beam_width, :start_block_idx + step].set(cur_block_tables[parent_beam_ids, :start_block_idx + step])
+            cur_block_tables = cur_block_tables.at[:beam_width, :start_block_idx + step + 1].set(cur_block_tables[parent_beam_ids, :start_block_idx + step + 1])
             
     return kv_caches, all_tokens, all_logprobs_token_ids, all_logprobs_scores, all_ranks
 from tpu_inference.utils import (device_array, make_optimized_mesh,
@@ -282,6 +302,11 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         for i in self._discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
+        
+        # Print all beams for debugging!
+        print(f"[Native Debug] All beams token IDs (num_reqs={self._num_reqs}):")
+        for b in range(min(self._num_reqs, 30)): # Limit to 30 to avoid flooding!
+            print(f"  Beam {b}: {valid_sampled_token_ids[b]}")
 
         if self._logprobs_tensors is not None:
             # Use materialize to ensure logprobs are ready on host when we return async results
@@ -1026,6 +1051,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_first_rank,
                      self.is_last_rank,
                  )
+                jax.debug.print("[Hidden States Debug - Prefill] raw hidden: {}", hidden_states[:5, :5])
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
@@ -1058,6 +1084,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 hidden_states,
                 lora_metadata,
             )
+            # Debug print!
+            if self.input_batch.num_reqs > 0:
+                is_prefill = self.input_batch.num_computed_tokens_cpu[0] < self.input_batch.num_prompt_tokens[0]
+                is_native_beam = self.input_batch.use_beam_search[0]
+                
+                if is_prefill:
+                    if is_native_beam:
+                        jax.debug.print("[Logits Debug - Native Prefill] raw logits: {}", logits[:5, :5])
+                        jax.debug.print("[Logits Debug - Native Prefill] Token 323 logit: {}", logits[0, 323])
+                        jax.debug.print("[Logits Debug - Native Prefill] Token 432 logit: {}", logits[0, 432])
+                    else:
+                        jax.debug.print("[Logits Debug - Normal Prefill] raw logits: {}", logits[:5, :5])
+                        jax.debug.print("[Logits Debug - Normal Prefill] Token 323 logit: {}", logits[0, 323])
+                        jax.debug.print("[Logits Debug - Normal Prefill] Token 432 logit: {}", logits[0, 432])
+                        jax.debug.print("[Block Tables Debug - Normal] block_tables: {}", self.requests[self.input_batch.req_ids[0]].block_ids)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -1148,14 +1189,26 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             # Fast way to find free block IDs without full search loop
             max_allocated_id = np.max(beam_0_block_ids)
-            # Allocate max_tokens blocks per beam!
-            free_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + beam_width * max_tokens))
+            
+            prompt_len = int(attn_metadata.seq_lens[0])
+            last_prompt_block_idx = (prompt_len - 1) // self.block_size
+            old_block_id = int(beam_0_block_ids[last_prompt_block_idx])
+            
+            # Allocate unique block IDs for the partially filled block for all 32 padded requests
+            cow_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + 32))
+            max_allocated_id += 32
+            
+            # Allocate max_tokens blocks for all 32 padded requests!
+            free_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + 32 * max_tokens))
             
             # Build cur_block_tables of shape (32, max_blocks)!
             cur_block_tables_np = np.zeros((32, self.max_num_blocks_per_req), dtype=np.int32)
             
-            for b in range(beam_width):
+            for b in range(32):
                 beam_b_blocks = np.copy(beam_0_block_ids)
+                # Point the partially filled block to the unique one
+                beam_b_blocks[last_prompt_block_idx] = cow_block_ids[b]
+                
                 zeros = np.where(beam_b_blocks == 0)[0]
                 if len(zeros) > 0:
                     for s in range(max_tokens):
@@ -1163,21 +1216,29 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                             beam_b_blocks[zeros[0] + s] = free_ids[b * max_tokens + s]
                 cur_block_tables_np[b] = beam_b_blocks
                 
+            # Perform physical copy of the partially filled block to the new blocks
+            new_kv_caches = []
+            cow_block_ids_jax = jnp.array(cow_block_ids, dtype=jnp.int32)
+            for layer_cache in self.kv_caches:
+                block_data = layer_cache[old_block_id]
+                layer_cache = layer_cache.at[cow_block_ids_jax].set(block_data)
+                new_kv_caches.append(layer_cache)
+            self.kv_caches = list(new_kv_caches)
+                
             zeros_0 = np.where(beam_0_block_ids == 0)[0]
             start_block_idx = int(zeros_0[0]) if len(zeros_0) > 0 else 0
                 
             cur_block_tables = device_array(self.mesh, cur_block_tables_np, sharding=attn_metadata.block_tables.sharding)
             
-            cur_positions_np = np.zeros((32,), dtype=np.int32)
-            cur_positions_np[:beam_width] = np.repeat(np.asarray(attn_metadata.input_positions)[-1:], beam_width) + 1
+            prompt_len = int(attn_metadata.seq_lens[0])
+            cur_positions_np = np.full((32,), prompt_len - 1, dtype=np.int32)
             cur_positions = device_array(self.mesh, cur_positions_np, sharding=attn_metadata.input_positions.sharding)
             
-            cur_seq_lens_np = np.zeros((32,), dtype=np.int32)
-            cur_seq_lens_np[:beam_width] = np.repeat(np.asarray(attn_metadata.seq_lens)[0:1], beam_width) + 1
+            cur_seq_lens_np = np.full((32,), prompt_len, dtype=np.int32)
             cur_seq_lens = device_array(self.mesh, cur_seq_lens_np, sharding=attn_metadata.seq_lens.sharding)
             
             cur_query_start_loc = jnp.arange(0, 33, dtype=jnp.int32)
-            cur_request_distribution = jnp.array([32, 32, 32], dtype=jnp.int32)
+            cur_request_distribution = jnp.array([beam_width, beam_width, beam_width], dtype=jnp.int32)
             
 
 
@@ -1187,7 +1248,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             all_logprobs_scores = []
             all_ranks = []
             
-            logits_step = logits.astype(jnp.float32)[:beam_width]
+            # At Step 0, only row 0 is valid (Prefill for 1 request).
+            # We must broadcast it to beam_width rows!
+            vocab_size = logits.shape[-1]
+            logits_step = jnp.broadcast_to(logits.astype(jnp.float32)[0:1], (beam_width, vocab_size))
+            
+            # Debug print specific token logits!
+            print(f"[Logits Debug Step 0] Token 323 logit: {logits[0, 323]}")
+            print(f"[Logits Debug Step 0] Token 432 logit: {logits[0, 432]}")
             
             # Step 0: Initial branching!
             first_beam_logits = logits_step[0]
@@ -1196,6 +1264,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             next_tokens = top30_token_ids.reshape(beam_width, 1)
             cum_logprobs = top30_logprobs
+            
+            # Debug prints for Step 0!
+            jax.debug.print("[Native Debug] Step 0: top logprobs = {}", top30_logprobs[:5])
+            jax.debug.print("[Native Debug] Step 0: top token_ids = {}", top30_token_ids[:5])
+            
+
             
             step_logprobs = self._compute_and_gather_logprobs(logits_step, next_tokens.ravel(), self.model_config.max_logprobs)
             
@@ -1209,16 +1283,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if pad_token_id is None:
                 pad_token_id = 0 # Fallback to 0 if both are None!
                 
-            (self.kv_caches, jitted_tokens, jitted_logprobs_token_ids, jitted_logprobs_scores, jitted_ranks) = _native_beam_search_loop_jit(
+            kv_caches_list = list(self.kv_caches)
+            (new_kv_caches, jitted_tokens, jitted_logprobs_token_ids, jitted_logprobs_scores, jitted_ranks) = _native_beam_search_loop_jit(
                 self.model_fn, self.compute_logits_fn, self._select_from_array_fn, self._compute_and_gather_logprobs,
                 max_tokens, beam_width, vocab_size, self.model_config.max_logprobs,
-                self.state, self.kv_caches, next_tokens, cum_logprobs,
+                self.state, kv_caches_list, next_tokens, cum_logprobs,
                 step_logprobs.logprob_token_ids, step_logprobs.logprobs, step_logprobs.selected_token_ranks,
                 cur_positions, cur_seq_lens, cur_block_tables,
                 cur_query_start_loc, cur_request_distribution, lora_metadata,
                 self.is_first_rank, self.is_last_rank, tuple(self.layer_name_to_kvcache_index.items()),
-                start_block_idx, pad_token_id
+                start_block_idx, pad_token_id, free_ids
             )
+            self.kv_caches = list(new_kv_caches)
             
             next_tokens = jnp.transpose(jitted_tokens, (1, 0, 2)).squeeze(axis=-1)
             
@@ -1976,11 +2052,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         first_req_state = self.requests[first_req_id]
         use_beam_search = first_req_state.sampling_params.use_beam_search if first_req_state.sampling_params else False
 
-        if use_beam_search:
-            padded_num_reqs = 32
-        else:
-            padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
-                num_reqs, self.max_num_reqs)
+        padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
+            num_reqs, self.max_num_reqs)
 
         # Please see runner_utils.PhasedBasedProfiler for details
         if self.phase_based_profiler:
@@ -2038,11 +2111,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         first_req_state = self.requests[first_req_id]
         use_beam_search = first_req_state.sampling_params.use_beam_search if first_req_state.sampling_params else False
 
-        if use_beam_search:
-            padded_num_reqs = 32
-        else:
-            padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
-                num_reqs, self.max_num_reqs)
+        padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
+            num_reqs, self.max_num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]

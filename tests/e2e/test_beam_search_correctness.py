@@ -11,11 +11,10 @@ def test_beam_search():
     model_name = "Qwen/Qwen3-0.6B"
     
     print("Initializing LLM...")
-    llm = LLM(model=model_name, max_model_len=2048)
+    llm = LLM(model=model_name, max_model_len=2048, gpu_memory_utilization=0.5, enable_prefix_caching=True, max_logprobs=60, kv_cache_dtype="bfloat16")
     
-    # Creative prompts that can take different paths!
+    # Simplify to a single prompt for reproduction!
     prompts = [
-        "If I could travel in time, the first thing I would do is",
         "The most unexpected thing happened when I opened the door,",
     ]
     
@@ -26,6 +25,7 @@ def test_beam_search():
         temperature=0.0,
         max_tokens=4,
         ignore_eos=True,
+        logprobs=1,
     )
     
     beam_params1 = SamplingParams(
@@ -35,7 +35,7 @@ def test_beam_search():
         use_beam_search=True,
         logprobs=1,
         n=1,  # Set to 1 to execute internally as single request with devices unrolled
-        extra_args={"beam_width": 10},  # Use 10 to avoid logprobs/OOM issues
+        extra_args={"beam_width": 30},
     )
     
     print("Running Greedy Inference...")
@@ -61,7 +61,7 @@ def test_beam_search():
     print("\n--- Subtest 2: CPU-based Beam Search (llm.beam_search) ---")
     
     beam_params2 = BeamSearchParams(
-        beam_width=10,  # Use 10 to avoid logprobs error
+        beam_width=30,
         max_tokens=4,
         ignore_eos=True,
     )
