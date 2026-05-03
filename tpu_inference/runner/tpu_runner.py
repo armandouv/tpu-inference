@@ -213,18 +213,16 @@ def _native_beam_search_loop_jit(
         
         # CoW for generated blocks inside JIT!
         start_block_idx = cur_seq_lens[0] // 128
-        free_ids_array = jnp.array(free_ids, dtype=jnp.int32).reshape(max_tokens, 32)
-        for b in range(beam_width):
-            p = parent_beam_ids[b]
-            src_block = cur_block_tables[p, start_block_idx]
-            dst_block = free_ids_array[step, b]
+        free_ids_array = free_ids.reshape(max_tokens, 32)
+        src_blocks = cur_block_tables[parent_beam_ids, start_block_idx]
+        dst_blocks = free_ids_array[step, :beam_width]
+        
+        # Copy KV cache across all layers!
+        for layer_idx in range(len(kv_caches)):
+            kv_caches[layer_idx] = kv_caches[layer_idx].at[dst_blocks].set(kv_caches[layer_idx][src_blocks])
             
-            # Copy KV cache across all layers!
-            for layer_idx in range(len(kv_caches)):
-                kv_caches[layer_idx] = kv_caches[layer_idx].at[dst_block].set(kv_caches[layer_idx][src_block])
-                
-            # Update cur_block_tables for this beam!
-            cur_block_tables = cur_block_tables.at[b, start_block_idx].set(dst_block)
+        # Update cur_block_tables for this beam!
+        cur_block_tables = cur_block_tables.at[:beam_width, start_block_idx].set(dst_blocks)
             
         next_tokens = token_ids.reshape(beam_width, 1)
         
@@ -248,6 +246,16 @@ def _native_beam_search_loop_jit(
             cur_block_tables = cur_block_tables.at[:beam_width].set(cur_block_tables[parent_beam_ids])
             
     return kv_caches, all_tokens, all_logprobs_token_ids, all_logprobs_scores, all_ranks
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def _cow_block_copy_jit(kv_caches, old_block_id, cow_block_ids_jax):
+    new_kv_caches = []
+    for layer_cache in kv_caches:
+        block_data = layer_cache[old_block_id]
+        layer_cache = layer_cache.at[cow_block_ids_jax].set(block_data)
+        new_kv_caches.append(layer_cache)
+    return new_kv_caches
+
 from tpu_inference.utils import (device_array, make_optimized_mesh,
                                  time_function, to_jax_dtype, to_torch_dtype)
 
@@ -1217,13 +1225,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 cur_block_tables_np[b] = beam_b_blocks
                 
             # Perform physical copy of the partially filled block to the new blocks
-            new_kv_caches = []
             cow_block_ids_jax = jnp.array(cow_block_ids, dtype=jnp.int32)
-            for layer_cache in self.kv_caches:
-                block_data = layer_cache[old_block_id]
-                layer_cache = layer_cache.at[cow_block_ids_jax].set(block_data)
-                new_kv_caches.append(layer_cache)
-            self.kv_caches = list(new_kv_caches)
+            self.kv_caches = _cow_block_copy_jit(self.kv_caches, old_block_id, cow_block_ids_jax)
                 
             zeros_0 = np.where(beam_0_block_ids == 0)[0]
             start_block_idx = int(zeros_0[0]) if len(zeros_0) > 0 else 0
@@ -1292,7 +1295,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 cur_positions, cur_seq_lens, cur_block_tables,
                 cur_query_start_loc, cur_request_distribution, lora_metadata,
                 self.is_first_rank, self.is_last_rank, tuple(self.layer_name_to_kvcache_index.items()),
-                start_block_idx, pad_token_id, free_ids
+                start_block_idx, pad_token_id, jnp.array(free_ids, dtype=jnp.int32)
             )
             self.kv_caches = list(new_kv_caches)
             
