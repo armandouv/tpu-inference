@@ -105,13 +105,14 @@ from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 @functools.partial(jax.jit, static_argnames=("beam_width", "step"), donate_argnums=(0,))
 def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width, start_block_idx, step, valid_tokens):
     def shuffle_layer(kv_cache):
+        original_kv_cache = kv_cache
         for b_idx in range(beam_width):
             p_b_idx = parent_beam_ids[b_idx]
             child_block = block_tables_2d[b_idx, start_block_idx]
             parent_block = block_tables_2d[p_b_idx, start_block_idx]
 
-            # Gather the parent block
-            parent_block_data = kv_cache[parent_block] # shape (128, heads, kv, dim)
+            # Gather the parent block from the ORIGINAL cache
+            parent_block_data = original_kv_cache[parent_block] # shape (128, heads, kv, dim)
             
             # Dynamic slice: start at valid_tokens, size is step (static from outer loop)
             start_indices = (valid_tokens, 0, 0, 0)
@@ -198,6 +199,13 @@ def _native_beam_search_loop_jit(
         cur_positions = cur_positions + 1
         cur_seq_lens = cur_seq_lens + 1
         
+        # Mask out padded requests in JIT to keep them at 0!
+        mask = jnp.arange(32, dtype=jnp.int32) < beam_width
+        # We DO NOT mask cur_positions to 0 because that causes padded requests to overwrite position 0 (prompt blocks).
+        # Since padded requests get unique blocks allocated for the current position, it is safe to let them write there.
+        # cur_positions = jnp.where(mask, cur_positions, 0)
+        # cur_seq_lens = jnp.where(mask, cur_seq_lens, 0)
+        
         cur_block_tables_1d = cur_block_tables.reshape(-1)
         
         from tpu_inference.layers.common.attention_metadata import AttentionMetadata
@@ -215,13 +223,30 @@ def _native_beam_search_loop_jit(
             None, is_first_rank, is_last_rank
         )
         
-        cur_logits_indices = jnp.arange(32, dtype=jnp.int32)
-        cur_logits_indices = jnp.where(cur_logits_indices < beam_width, cur_logits_indices, 0)
+        cur_logits_indices = jnp.arange(beam_width, dtype=jnp.int32)
         hidden_states = select_from_array_fn(hidden_states, cur_logits_indices)
+        
+        norms = jnp.linalg.norm(hidden_states, axis=-1)
+        jax.debug.print("Step {s} hidden_states norms: {x}", s=step, x=norms)
+        jax.debug.print("Step {s} hidden_states[0, :5]: {x}", s=step, x=hidden_states[0, :5])
+        jax.debug.print("Step {s} hidden_states[1, :5]: {x}", s=step, x=hidden_states[1, :5])
+        
         logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
         
+        jax.debug.print("Step {s} logits shape: {x}", s=step, x=logits_step.shape)
+        jax.debug.print("Step {s} logits: {x}", s=step, x=logits_step)
+        
+        logprobs_step = jax.nn.log_softmax(logits_step, axis=-1)
+        top_scores, top_tokens = jax.lax.top_k(logprobs_step + cum_logprobs[:, None], k=30)
+        jax.debug.print("Step {s} top 30 cum_logprobs: {x}", s=step, x=top_scores)
+        jax.debug.print("Step {s} top 30 tokens: {x}", s=step, x=top_tokens)
+        
         parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id)
+        
+        jax.debug.print("Step {s} parent_beam_ids: {x}", s=step, x=parent_beam_ids)
+        jax.debug.print("Step {s} token_ids: {x}", s=step, x=token_ids)
+        jax.debug.print("Step {s} cum_logprobs: {x}", s=step, x=cum_logprobs)
         
         """
         # CoW for generated blocks inside JIT!
@@ -266,10 +291,9 @@ def _native_beam_search_loop_jit(
         # Shuffle output sequence histories across columns according to parent_beam_ids!
         all_tokens = all_tokens.at[:step].set(all_tokens[:step, parent_beam_ids])
         all_logprobs_token_ids = all_logprobs_token_ids.at[:step].set(all_logprobs_token_ids[:step, parent_beam_ids])
-        # Shuffle block tables instead of KV caches!
-        #if step < max_tokens - 1:
-        #    cur_block_tables = cur_block_tables.at[:beam_width].set(cur_block_tables[parent_beam_ids])
-            
+        all_logprobs_scores = all_logprobs_scores.at[:step].set(all_logprobs_scores[:step, parent_beam_ids])
+        all_ranks = all_ranks.at[:step].set(all_ranks[:step, parent_beam_ids])
+        
     return kv_caches, all_tokens, all_logprobs_token_ids, all_logprobs_scores, all_ranks
 
 @functools.partial(jax.jit, static_argnames=("valid_tokens",), donate_argnums=(0,))
@@ -1238,9 +1262,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             prompt_len = int(attn_metadata.seq_lens[0])
             cur_positions_np = np.full((32,), prompt_len - 1, dtype=np.int32)
+            cur_positions_np[beam_width:] = 0 # Mask out padded requests!
             cur_positions = device_array(self.mesh, cur_positions_np, sharding=attn_metadata.input_positions.sharding)
             
             cur_seq_lens_np = np.full((32,), prompt_len, dtype=np.int32)
+            cur_seq_lens_np[beam_width:] = 0 # Mask out padded requests!
             cur_seq_lens = device_array(self.mesh, cur_seq_lens_np, sharding=attn_metadata.seq_lens.sharding)
             
             cur_query_start_loc = jnp.arange(0, 33, dtype=jnp.int32)
@@ -1263,6 +1289,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             first_beam_logits = logits_step[0]
             first_beam_logprobs = jax.nn.log_softmax(first_beam_logits, axis=-1)
             top30_logprobs, top30_token_ids = jax.lax.top_k(first_beam_logprobs, beam_width)
+            
+            print(f"Step 0 top30_token_ids: {top30_token_ids}")
+            print(f"Step 0 top30_logprobs: {top30_logprobs}")
             
             next_tokens = top30_token_ids.reshape(beam_width, 1)
             cum_logprobs = top30_logprobs
@@ -1305,7 +1334,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 is_first_rank=self.is_first_rank,
                 is_last_rank=self.is_last_rank,
                 layer_name_to_kvcache_index=tuple(self.layer_name_to_kvcache_index.items()),
-                start_block_idx=start_block_idx,
+                start_block_idx=last_prompt_block_idx,
                 pad_token_id=pad_token_id,
                 free_ids=jnp.array(free_ids, dtype=jnp.int32),
                 valid_tokens=valid_tokens
@@ -1358,6 +1387,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
         elif spec_decode_metadata is None:
             logits = logits.astype(jnp.float32)
+            
+            print(f"Normal execution hidden_states norms: {jnp.linalg.norm(hidden_states, axis=-1)}")
+            print(f"Normal execution hidden_states[0, :5]: {hidden_states[0, :5]}")
+            print(f"Normal execution hidden_states[1, :5]: {hidden_states[1, :5]}")
+            
+            # Extract top 30 for comparison!
+            top_scores, top_indices = jax.lax.top_k(logits[0], k=30)
+            print(f"Normal execution Step 0 top 30 logits: {top_scores}")
+            print(f"Normal execution Step 0 top 30 tokens: {top_indices}")
+            
             with self.maybe_forbid_compile:
                 next_tokens, processed_logits = sample(
                     step_rng,
