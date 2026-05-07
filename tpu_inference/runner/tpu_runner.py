@@ -104,26 +104,25 @@ from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 
 @functools.partial(jax.jit, static_argnames=("beam_width", "step"), donate_argnums=(0,))
 def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width, start_block_idx, step, valid_tokens):
+    # Get the block IDs we need to read from
+    parent_blocks = block_tables_2d[parent_beam_ids, start_block_idx]
+    
     def shuffle_layer(kv_cache):
-        original_kv_cache = kv_cache
-        for b_idx in range(beam_width):
-            p_b_idx = parent_beam_ids[b_idx]
-            child_block = block_tables_2d[b_idx, start_block_idx]
-            parent_block = block_tables_2d[p_b_idx, start_block_idx]
+        # Read ONLY the needed parent blocks up front (e.g., 30 blocks).
+        # This avoids hazards and doesn't copy the whole cache.
+        parent_data = kv_cache[parent_blocks] # shape (beam_width, 128, heads, kv, dim)
 
-            # Gather the parent block from the ORIGINAL cache
-            parent_block_data = original_kv_cache[parent_block] # shape (128, heads, kv, dim)
-            
-            # Dynamic slice: start at valid_tokens, size is step (static from outer loop)
+        for b_idx in range(beam_width):
+            child_block = block_tables_2d[b_idx, start_block_idx]
+            # Extract from the small cached buffer
+            parent_block_data = parent_data[b_idx]
+
             start_indices = (valid_tokens, 0, 0, 0)
             slice_sizes = (step, parent_block_data.shape[1], parent_block_data.shape[2], parent_block_data.shape[3])
             
             extracted_tokens = jax.lax.dynamic_slice(parent_block_data, start_indices, slice_sizes)
-            
-            # Expand dimensions to match operand rank (Rank 5)
             extracted_tokens = jnp.expand_dims(extracted_tokens, axis=0)
             
-            # Dynamic update slice: put it into child block at valid_tokens
             update_start_indices = (child_block, valid_tokens, 0, 0, 0)
             kv_cache = jax.lax.dynamic_update_slice(kv_cache, extracted_tokens, update_start_indices)
             
@@ -198,9 +197,7 @@ def _native_beam_search_loop_jit(
         
         cur_positions = cur_positions + 1
         cur_seq_lens = cur_seq_lens + 1
-        
-        # Mask out padded requests in JIT to keep them at 0!
-        mask = jnp.arange(32, dtype=jnp.int32) < beam_width
+
         # We DO NOT mask cur_positions to 0 because that causes padded requests to overwrite position 0 (prompt blocks).
         # Since padded requests get unique blocks allocated for the current position, it is safe to let them write there.
         # cur_positions = jnp.where(mask, cur_positions, 0)
@@ -225,29 +222,12 @@ def _native_beam_search_loop_jit(
         
         cur_logits_indices = jnp.arange(beam_width, dtype=jnp.int32)
         hidden_states = select_from_array_fn(hidden_states, cur_logits_indices)
-        
-        norms = jnp.linalg.norm(hidden_states, axis=-1)
-        jax.debug.print("Step {s} hidden_states norms: {x}", s=step, x=norms)
-        jax.debug.print("Step {s} hidden_states[0, :5]: {x}", s=step, x=hidden_states[0, :5])
-        jax.debug.print("Step {s} hidden_states[1, :5]: {x}", s=step, x=hidden_states[1, :5])
-        
+
         logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
-        
-        jax.debug.print("Step {s} logits shape: {x}", s=step, x=logits_step.shape)
-        jax.debug.print("Step {s} logits: {x}", s=step, x=logits_step)
-        
-        logprobs_step = jax.nn.log_softmax(logits_step, axis=-1)
-        top_scores, top_tokens = jax.lax.top_k(logprobs_step + cum_logprobs[:, None], k=30)
-        jax.debug.print("Step {s} top 30 cum_logprobs: {x}", s=step, x=top_scores)
-        jax.debug.print("Step {s} top 30 tokens: {x}", s=step, x=top_tokens)
-        
+
         parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id)
-        
-        jax.debug.print("Step {s} parent_beam_ids: {x}", s=step, x=parent_beam_ids)
-        jax.debug.print("Step {s} token_ids: {x}", s=step, x=token_ids)
-        jax.debug.print("Step {s} cum_logprobs: {x}", s=step, x=cum_logprobs)
-        
+
         """
         # CoW for generated blocks inside JIT!
         start_block_idx = cur_seq_lens[0] // 128
