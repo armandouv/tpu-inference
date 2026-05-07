@@ -276,12 +276,18 @@ def _native_beam_search_loop_jit(
         
     return kv_caches, all_tokens, all_logprobs_token_ids, all_logprobs_scores, all_ranks
 
-@functools.partial(jax.jit, static_argnames=("valid_tokens",), donate_argnums=(0,))
-def _cow_block_copy_jit(kv_caches, old_block_id, cow_block_ids_jax, valid_tokens):
+@functools.partial(jax.jit, static_argnames=("beam_width",), donate_argnums=(0,))
+def _cow_block_copy_jit(kv_caches, old_block_id, cow_block_ids_jax, beam_width):
     new_kv_caches = []
     for layer_cache in kv_caches:
-        block_data = layer_cache[old_block_id, :valid_tokens]
-        layer_cache = layer_cache.at[cow_block_ids_jax, :valid_tokens].set(block_data)
+        block_data = layer_cache[old_block_id]
+        block_data_expanded = jnp.expand_dims(block_data, axis=0)
+        
+        for i in range(beam_width):
+            child_block = cow_block_ids_jax[i]
+            start_indices = (child_block, 0, 0, 0, 0)
+            layer_cache = jax.lax.dynamic_update_slice(layer_cache, block_data_expanded, start_indices)
+            
         new_kv_caches.append(layer_cache)
     return new_kv_caches
 
@@ -1296,7 +1302,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # However, this might not be the case, handle that case.
             # TODO(armandouv): Verify apples-to-apples parity with the standard beam search implementation. For some reason, the approach
             # with allocating a new block per beam per step and updating seq_len + block_size has better quality than this correct one.
-            self.kv_caches = _cow_block_copy_jit(self.kv_caches, old_block_id, cow_block_ids_jax, valid_tokens)
+            self.kv_caches = _cow_block_copy_jit(self.kv_caches, old_block_id, cow_block_ids_jax, beam_width)
             kv_caches_list = list(self.kv_caches)
             (new_kv_caches, jitted_tokens, jitted_logprobs_token_ids, jitted_logprobs_scores, jitted_ranks) = _native_beam_search_loop_jit(
                 self.model_fn, self.compute_logits_fn, self._select_from_array_fn, self._compute_and_gather_logprobs,
