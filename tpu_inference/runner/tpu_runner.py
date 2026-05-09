@@ -102,32 +102,21 @@ import functools
 # KV cache shuffling removed in favor of block table sharing!
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 
-@functools.partial(jax.jit, static_argnames=("beam_width", "step"), donate_argnums=(0,))
-def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width, start_block_idx, step, valid_tokens):
-    # Get the block IDs we need to read from
-    parent_blocks = block_tables_2d[parent_beam_ids, start_block_idx]
+@functools.partial(jax.jit, static_argnames=("beam_width",), donate_argnums=(0,))
+def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width, current_block_idx):
+    parent_blocks = block_tables_2d[parent_beam_ids, current_block_idx]
+    child_blocks = block_tables_2d[:beam_width, current_block_idx]
     
     def shuffle_layer(kv_cache):
-        # Read ONLY the needed parent blocks up front (e.g., 30 blocks).
-        # This avoids hazards and doesn't copy the whole cache.
-        parent_data = kv_cache[parent_blocks] # shape (beam_width, 128, heads, kv, dim)
-
-        for b_idx in range(beam_width):
-            child_block = block_tables_2d[b_idx, start_block_idx]
-            # Extract from the small cached buffer
-            parent_block_data = parent_data[b_idx]
-
-            start_indices = (valid_tokens, 0, 0, 0)
-            slice_sizes = (step, parent_block_data.shape[1], parent_block_data.shape[2], parent_block_data.shape[3])
-            
-            extracted_tokens = jax.lax.dynamic_slice(parent_block_data, start_indices, slice_sizes)
-            extracted_tokens = jnp.expand_dims(extracted_tokens, axis=0)
-            
-            update_start_indices = (child_block, valid_tokens, 0, 0, 0)
-            kv_cache = jax.lax.dynamic_update_slice(kv_cache, extracted_tokens, update_start_indices)
+        parent_data = kv_cache[parent_blocks]
+        
+        for i in range(beam_width):
+            child_block = child_blocks[i]
+            start_indices = (child_block, 0, 0, 0, 0)
+            kv_cache = jax.lax.dynamic_update_slice(kv_cache, jnp.expand_dims(parent_data[i], 0), start_indices)
             
         return kv_cache
-    
+        
     return [shuffle_layer(c) for c in kv_caches]
 
 
@@ -170,7 +159,7 @@ def _native_beam_search_loop_jit(
     cur_positions, cur_seq_lens, cur_block_tables,
     cur_query_start_loc, cur_request_distribution, lora_metadata,
     is_first_rank, is_last_rank, layer_name_to_kvcache_index,
-    start_block_idx, pad_token_id, free_ids, valid_tokens
+    start_block_idx, pad_token_id, valid_tokens
 ):
     """Executes the autoregressive decoding loop for beam search on TPU.
 
@@ -254,9 +243,31 @@ def _native_beam_search_loop_jit(
                 
             kv_caches = jax.tree_util.tree_map(_copy_last_block, kv_caches)
         """
+        # Calculate prompt_len dynamically (it is fixed for the batch)
+        # At step S, cur_seq_lens[0] is prompt_len + S.
+        prompt_len = cur_seq_lens[0] - step
+        # Last block the prompt was written to.
+        last_prompt_block_idx = (prompt_len - 1) // 128
+        
+        # Last prompt generated tokens have been written to.
+        current_block_idx = (cur_seq_lens[0] - 1) // 128
+        
+        # Whether we wrote into the extra block for this step.
+        crossed_boundary = (current_block_idx > last_prompt_block_idx).astype(jnp.int32)
+        
+        parent_completed_block = cur_block_tables[parent_beam_ids, last_prompt_block_idx]
+        current_child_block = cur_block_tables[:beam_width, last_prompt_block_idx]
+        
+        # Update the previous block also if we crossed the boundary. If not, just
+        # write the same block.
+        # If the prompt filled blocks perfectly, we update it with the same prefix.
+        new_block = crossed_boundary * parent_completed_block + (1 - crossed_boundary) * current_child_block
+
+        cur_block_tables = cur_block_tables.at[:beam_width, last_prompt_block_idx].set(new_block)
+        
         # We don't need to shuffle the kv-caches on the last step
         if step < max_tokens - 1:
-            kv_caches = _shuffle_kv_caches(kv_caches, parent_beam_ids, cur_block_tables, beam_width, start_block_idx, step, valid_tokens)
+            kv_caches = _shuffle_kv_caches(kv_caches, parent_beam_ids, cur_block_tables, beam_width, current_block_idx)
             
         next_tokens = token_ids.reshape(beam_width, 1)
         
@@ -1207,42 +1218,45 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             # Scratchpad Block Theft!
             beam_0_block_ids = self.input_batch.block_table[0].get_cpu_tensor()[0]
-            
-            # Fast way to find free block IDs without full search loop
             max_allocated_id = np.max(beam_0_block_ids)
             
             prompt_len = int(attn_metadata.seq_lens[0])
+            valid_tokens = prompt_len % self.block_size
             last_prompt_block_idx = (prompt_len - 1) // self.block_size
             old_block_id = int(beam_0_block_ids[last_prompt_block_idx])
             
-            # Allocate unique block IDs for the partially filled block for all 32 padded requests
-            cow_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + 32))
-            max_allocated_id += 32
-            
-            # Allocate 1 block for all 32 padded requests (in case we cross a boundary)!
-            free_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + 32))
-            
-            # Build cur_block_tables of shape (32, max_blocks)!
             cur_block_tables_np = np.zeros((32, self.max_num_blocks_per_req), dtype=np.int32)
             
-            for b in range(32):
-                beam_b_blocks = np.copy(beam_0_block_ids)
-                # Point the partially filled block to the unique one
-                beam_b_blocks[last_prompt_block_idx] = cow_block_ids[b]
-                
-                zeros = np.where(beam_b_blocks == 0)[0]
-                if len(zeros) > 0:
-                    beam_b_blocks[zeros[0]] = free_ids[b]
-                cur_block_tables_np[b] = beam_b_blocks
-                
-            # Perform physical copy of the partially filled block to the new blocks
-            cow_block_ids_jax = jnp.array(cow_block_ids, dtype=jnp.int32)
-            valid_tokens = int(attn_metadata.seq_lens[0]) % 128
             if valid_tokens == 0:
-                valid_tokens = 128
-                
-            zeros_0 = np.where(beam_0_block_ids == 0)[0]
-            start_block_idx = int(zeros_0[0]) if len(zeros_0) > 0 else 0
+                # Case 1: Perfectly full block.
+                # Active block to write to is last_prompt_block_idx + 1. We only need to allocate 1 unique block per beam for it.
+                # TODO(armandouv): Maybe throw an error if we don't fit generation length in the block size, but
+                # not likely.
+                extra_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + 32))
+                max_allocated_id += 32
+                for b in range(32):
+                    beam_b_blocks = np.copy(beam_0_block_ids)
+                    beam_b_blocks[last_prompt_block_idx + 1] = extra_block_ids[b]
+                    cur_block_tables_np[b] = beam_b_blocks
+                cow_block_ids = []
+            else:
+                # Case 2 & 3: Partially filled block.
+                # Active block is last_prompt_block_idx, which we CoW. We also allocate an extra block at index + 1.
+                cow_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + 32))
+                max_allocated_id += 32
+                extra_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + 32))
+                max_allocated_id += 32
+                for b in range(32):
+                    beam_b_blocks = np.copy(beam_0_block_ids)
+                    beam_b_blocks[last_prompt_block_idx] = cow_block_ids[b]
+                    beam_b_blocks[last_prompt_block_idx + 1] = extra_block_ids[b]
+                    cur_block_tables_np[b] = beam_b_blocks
+                    
+            cow_block_ids_jax = jnp.array(cow_block_ids, dtype=jnp.int32)
+            
+            # Remove unused flags and comments
+            # We ALWAYS do the CoW copy of the last prompt block ONLY IF IT IS NOT FULL!
+            # This is now handled below with `if valid_tokens > 0:`.
                 
             cur_block_tables = device_array(self.mesh, cur_block_tables_np, sharding=attn_metadata.block_tables.sharding)
             
@@ -1296,13 +1310,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if pad_token_id is None:
                 pad_token_id = 0 # Fallback to 0 if both are None!
 
-            # TODO(armandouv): Fix NaN issues.
-            # TODO(armandouv): Avoid recompilations in cow jit. Use dynamic_slice to make it run fast for given valid tokens.
-            # TODO(armandouv): Currently, we assume that the current block still has enough space for the remaining 3 tokens to decode.
-            # However, this might not be the case, handle that case.
-            # TODO(armandouv): Verify apples-to-apples parity with the standard beam search implementation. For some reason, the approach
-            # with allocating a new block per beam per step and updating seq_len + block_size has better quality than this correct one.
-            self.kv_caches = _cow_block_copy_jit(self.kv_caches, old_block_id, cow_block_ids_jax, beam_width)
+            # TODO(armandouv): Fix nan issues.
+            # TODO(armandouv): Compare exact outputs in test. Test the 3 scenarios.
+            # We only do the CoW copy if the last prompt block is not full!
+            # TODO(armandouv): maybe move this to the same if branch when valid_tokens is not 0.
+            if valid_tokens > 0:
+                self.kv_caches = _cow_block_copy_jit(self.kv_caches, old_block_id, cow_block_ids_jax, beam_width)
             kv_caches_list = list(self.kv_caches)
             (new_kv_caches, jitted_tokens, jitted_logprobs_token_ids, jitted_logprobs_scores, jitted_ranks) = _native_beam_search_loop_jit(
                 self.model_fn, self.compute_logits_fn, self._select_from_array_fn, self._compute_and_gather_logprobs,
@@ -1322,7 +1335,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 layer_name_to_kvcache_index=tuple(self.layer_name_to_kvcache_index.items()),
                 start_block_idx=last_prompt_block_idx,
                 pad_token_id=pad_token_id,
-                free_ids=jnp.array(free_ids, dtype=jnp.int32),
                 valid_tokens=valid_tokens
             )
             self.kv_caches = list(new_kv_caches)
