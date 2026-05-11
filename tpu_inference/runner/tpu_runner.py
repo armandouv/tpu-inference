@@ -1209,6 +1209,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             cur_block_tables_np = np.zeros((padded_beam_width, self.max_num_blocks_per_req), dtype=np.int32)
             
+            # Determine if generation will cross into the next block
+            crosses_boundary = (valid_tokens == 0) or (valid_tokens + max_tokens > self.block_size)
+            
+            if crosses_boundary:
+                if last_prompt_block_idx + 1 >= self.max_num_blocks_per_req:
+                    raise ValueError(
+                        f"Request exceeded maximum block capacity. Tried to allocate block index "
+                        f"{last_prompt_block_idx + 1} but maximum blocks per request is {self.max_num_blocks_per_req}."
+                    )
+            
             if valid_tokens == 0:
                 # Case 1: Perfectly full block.
                 # Active block to write to is last_prompt_block_idx + 1. We only need to allocate 1 unique block per beam for it.
@@ -1223,15 +1233,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 cow_block_ids = []
             else:
                 # Case 2 & 3: Partially filled block.
-                # Active block is last_prompt_block_idx, which we CoW. We also allocate an extra block at index + 1.
+                # Active block is last_prompt_block_idx, which we CoW.
                 cow_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + padded_beam_width))
                 max_allocated_id += padded_beam_width
-                extra_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + padded_beam_width))
-                max_allocated_id += padded_beam_width
+                
+                if crosses_boundary:
+                    extra_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + padded_beam_width))
+                    max_allocated_id += padded_beam_width
+                else:
+                    extra_block_ids = None
+                
                 for b in range(padded_beam_width):
                     beam_b_blocks = np.copy(beam_0_block_ids)
                     beam_b_blocks[last_prompt_block_idx] = cow_block_ids[b]
-                    beam_b_blocks[last_prompt_block_idx + 1] = extra_block_ids[b]
+                    if crosses_boundary:
+                        beam_b_blocks[last_prompt_block_idx + 1] = extra_block_ids[b]
                     cur_block_tables_np[b] = beam_b_blocks
                     
             cow_block_ids_jax = jnp.array(cow_block_ids, dtype=jnp.int32)
