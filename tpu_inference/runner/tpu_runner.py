@@ -1145,10 +1145,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if self.input_batch.num_reqs > 0:
                 first_req_id = cast(list[str], self.input_batch.req_ids)[0]
                 first_req_state = self.requests[first_req_id]
-                if first_req_state.sampling_params and first_req_state.sampling_params.extra_args:
-                    beam_width = first_req_state.sampling_params.extra_args.get("beam_width", beam_width)
-                elif "VLLM_BEAM_WIDTH" in os.environ:
-                    beam_width = int(os.environ["VLLM_BEAM_WIDTH"])
+                if first_req_state.sampling_params:
+                    beam_width = getattr(first_req_state.sampling_params, "n", 1) or 1
+                    if beam_width <= 1 and first_req_state.sampling_params.extra_args:
+                        beam_width = first_req_state.sampling_params.extra_args.get("beam_width", 30)
+                    elif beam_width <= 1 and "VLLM_BEAM_WIDTH" in os.environ:
+                        beam_width = int(os.environ["VLLM_BEAM_WIDTH"])
             padded_beam_width = runner_utils.get_padded_num_reqs_with_upper_limit(
                 beam_width, self.max_num_reqs)
 
@@ -1180,10 +1182,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             
             import os
             beam_width = 30
-            if first_req_state.sampling_params and first_req_state.sampling_params.extra_args:
-                beam_width = first_req_state.sampling_params.extra_args.get("beam_width", beam_width)
-            elif "VLLM_BEAM_WIDTH" in os.environ:
-                beam_width = int(os.environ["VLLM_BEAM_WIDTH"])
+            if first_req_state.sampling_params:
+                beam_width = getattr(first_req_state.sampling_params, "n", 1) or 1
+                if beam_width <= 1 and first_req_state.sampling_params.extra_args:
+                    beam_width = first_req_state.sampling_params.extra_args.get("beam_width", 30)
+                elif beam_width <= 1 and "VLLM_BEAM_WIDTH" in os.environ:
+                    beam_width = int(os.environ["VLLM_BEAM_WIDTH"])
             max_tokens = first_req_state.sampling_params.max_tokens if first_req_state.sampling_params else 4
             logger.info(f"DEBUG: Running beam search loop for {max_tokens} tokens")
             
