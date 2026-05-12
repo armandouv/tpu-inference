@@ -150,7 +150,7 @@ def _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id):
     
     return parent_beam_ids, token_ids, top_scores
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 23, 24, 25, 26, 27), donate_argnums=(11, 19))
+@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 23, 24, 25, 26, 27, 28), donate_argnums=(11, 19))
 def _native_beam_search_loop_jit(
     model_fn, compute_logits_fn, select_from_array_fn, compute_and_gather_logprobs_fn,
     max_tokens, beam_width, padded_beam_width, block_size, vocab_size, max_logprobs,
@@ -159,7 +159,7 @@ def _native_beam_search_loop_jit(
     cur_positions, cur_seq_lens, cur_block_tables,
     cur_query_start_loc, cur_request_distribution, lora_metadata,
     is_first_rank, is_last_rank, layer_name_to_kvcache_index,
-    start_block_idx, pad_token_id, valid_tokens
+    start_block_idx, pad_token_id, eos_token_id, valid_tokens
 ):
     """Executes the autoregressive decoding loop for beam search on TPU.
 
@@ -181,8 +181,12 @@ def _native_beam_search_loop_jit(
     # We start the loop from step 1, and let the caller fill step 0 in the returned arrays!
     
     for step in range(1, max_tokens):
+        # Mask out finished/completed beams to prevent them from generating NaNs and continuing execution
+        is_eos = (next_tokens.ravel() == eos_token_id) | (next_tokens.ravel() == pad_token_id)
+        cur_input_tokens = jnp.where(is_eos[:, None], pad_token_id, next_tokens)
+
         cur_input_ids_padded = jnp.zeros((padded_beam_width, 1), dtype=next_tokens.dtype)
-        cur_input_ids_padded = cur_input_ids_padded.at[:beam_width].set(next_tokens)
+        cur_input_ids_padded = cur_input_ids_padded.at[:beam_width].set(cur_input_tokens)
         
         cur_positions = cur_positions + 1
         cur_seq_lens = cur_seq_lens + 1
@@ -215,7 +219,8 @@ def _native_beam_search_loop_jit(
         logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
 
-        parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id)
+        cum_logprobs_masked = jnp.where(is_eos, -jnp.inf, cum_logprobs)
+        parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(logits_step, cum_logprobs_masked, beam_width, pad_token_id)
 
         # Calculate prompt_len dynamically (it is fixed for the batch)
         # At step S, cur_seq_lens[0] is prompt_len + S.
@@ -1198,15 +1203,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # So the NEXT step will still only be 1 request!
             # So we MUST run the Decode loop entirely inside this function!!!
             
-            # Scratchpad Block Theft!
             beam_0_block_ids = self.input_batch.block_table[0].get_cpu_tensor()[0]
-            max_allocated_id = np.max(beam_0_block_ids)
             
             prompt_len = int(attn_metadata.seq_lens[0])
             valid_tokens = prompt_len % self.block_size
             last_prompt_block_idx = (prompt_len - 1) // self.block_size
             old_block_id = int(beam_0_block_ids[last_prompt_block_idx])
             
+            scheduler_num_blocks = self.cache_config.num_gpu_blocks
             cur_block_tables_np = np.zeros((padded_beam_width, self.max_num_blocks_per_req), dtype=np.int32)
             
             # Determine if generation will cross into the next block
@@ -1219,36 +1223,45 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         f"{last_prompt_block_idx + 1} but maximum blocks per request is {self.max_num_blocks_per_req}."
                     )
             
+            max_beam_width = self.vllm_config.additional_config.get("max_beam_width", 100)
+            if beam_width > max_beam_width:
+                raise ValueError(
+                    f"Requested beam width {beam_width} exceeds maximum configured "
+                    f"beam width {max_beam_width}. Please increase max_beam_width "
+                    f"in additional_config."
+                )
+
+            # Reserve static range from our physical headroom:
+            # [scheduler_num_blocks, scheduler_num_blocks + 29] -> cow_block_ids
+            # [scheduler_num_blocks + 30, scheduler_num_blocks + 59] -> extra_block_ids
+            # [scheduler_num_blocks + 60] -> dummy_block_id
+            static_cow_block_ids = list(range(scheduler_num_blocks, scheduler_num_blocks + beam_width))
+            static_extra_block_ids = list(range(scheduler_num_blocks + beam_width, scheduler_num_blocks + 2 * beam_width))
+            dummy_block_id = scheduler_num_blocks + 2 * beam_width
+            
             if valid_tokens == 0:
                 # Case 1: Perfectly full block.
                 # Active block to write to is last_prompt_block_idx + 1. We only need to allocate 1 unique block per beam for it.
-                # TODO(armandouv): Maybe throw an error if we don't fit generation length in the block size, but
-                # not likely.
-                extra_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + padded_beam_width))
-                max_allocated_id += padded_beam_width
-                for b in range(padded_beam_width):
+                for b in range(beam_width):
                     beam_b_blocks = np.copy(beam_0_block_ids)
-                    beam_b_blocks[last_prompt_block_idx + 1] = extra_block_ids[b]
+                    beam_b_blocks[last_prompt_block_idx + 1] = static_extra_block_ids[b]
                     cur_block_tables_np[b] = beam_b_blocks
                 cow_block_ids = []
             else:
                 # Case 2 & 3: Partially filled block.
                 # Active block is last_prompt_block_idx, which we CoW.
-                cow_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + padded_beam_width))
-                max_allocated_id += padded_beam_width
+                cow_block_ids = static_cow_block_ids
                 
-                if crosses_boundary:
-                    extra_block_ids = list(range(max_allocated_id + 1, max_allocated_id + 1 + padded_beam_width))
-                    max_allocated_id += padded_beam_width
-                else:
-                    extra_block_ids = None
-                
-                for b in range(padded_beam_width):
+                for b in range(beam_width):
                     beam_b_blocks = np.copy(beam_0_block_ids)
                     beam_b_blocks[last_prompt_block_idx] = cow_block_ids[b]
                     if crosses_boundary:
-                        beam_b_blocks[last_prompt_block_idx + 1] = extra_block_ids[b]
+                        beam_b_blocks[last_prompt_block_idx + 1] = static_extra_block_ids[b]
                     cur_block_tables_np[b] = beam_b_blocks
+            
+            # Assign completely private dummy blocks to the padded requests to isolate their KV cache writes
+            for b in range(beam_width, padded_beam_width):
+                cur_block_tables_np[b].fill(dummy_block_id)
                     
             cow_block_ids_jax = jnp.array(cow_block_ids, dtype=jnp.int32)
             
@@ -1301,12 +1314,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             lora_metadata = self.lora_utils.extract_lora_metadata()
             vocab_size = logits_step.shape[-1]
 
-            # Extract pad_token_id programmatically!
+            # Extract pad_token_id and eos_token_id programmatically!
             pad_token_id = getattr(self.model_config.hf_config, "pad_token_id", None)
             if pad_token_id is None:
                 pad_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
+            if isinstance(pad_token_id, list):
+                pad_token_id = pad_token_id[0]
             if pad_token_id is None:
                 pad_token_id = 0 # Fallback to 0 if both are None!
+
+            eos_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
+            if isinstance(eos_token_id, list):
+                eos_token_id = eos_token_id[0]
+            if eos_token_id is None:
+                eos_token_id = pad_token_id
 
             # TODO(armandouv): Fix nan issues.
             # TODO(armandouv): Compare exact outputs in test. Test the 3 scenarios.
@@ -1333,6 +1354,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 layer_name_to_kvcache_index=tuple(self.layer_name_to_kvcache_index.items()),
                 start_block_idx=last_prompt_block_idx,
                 pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
                 valid_tokens=valid_tokens
             )
             self.kv_caches = list(new_kv_caches)

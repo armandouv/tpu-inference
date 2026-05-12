@@ -715,8 +715,14 @@ class KVCacheManager:
                                 text_config.qk_rope_head_dim
                         else:
                             head_size = layer_spec.head_size
+                        # Dynamically compute private physical block headroom based on maximum supported beam width.
+                        max_beam_width = self.runner.vllm_config.additional_config.get("max_beam_width", 100)
+                        reserved_headroom = 2 * max_beam_width + 1
+
+                        # Reserve physical blocks as private headroom for native beam search branching.
+                        # This keeps these blocks 100% invisible to the scheduler and avoids any out-of-bounds HBM access.
                         kv_cache = create_kv_caches(
-                            num_blocks=num_blocks,
+                            num_blocks=num_blocks + reserved_headroom,
                             block_size=layer_spec.block_size,
                             num_kv_heads=layer_spec.num_kv_heads,
                             head_size=head_size,
