@@ -1139,7 +1139,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices_selector: Optional[List[int]] = None,
         padded_num_reqs: Optional[int] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
-        if tpu_sampling_metadata.use_beam_search:
+        use_beam_search = tpu_sampling_metadata.use_beam_search
+        if use_beam_search and self.input_batch.num_reqs > 0:
+            first_req_id = cast(list[str], self.input_batch.req_ids)[0]
+            first_req_state = self.requests[first_req_id]
+            seq_len = (first_req_state.num_computed_tokens +
+                       scheduler_output.num_scheduled_tokens[first_req_id])
+            if seq_len < first_req_state.num_tokens:
+                use_beam_search = False
+
+        if use_beam_search:
             import os
             beam_width = 30
             if self.input_batch.num_reqs > 0:
@@ -1155,7 +1164,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 beam_width, self.max_num_reqs)
 
         if padded_num_reqs is None:
-            if tpu_sampling_metadata.use_beam_search:
+            if use_beam_search:
                 padded_num_reqs = padded_beam_width
             else:
                 padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
@@ -1174,7 +1183,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         for req_id in req_ids:
             prompt_logprobs_dict[req_id] = None
 
-        if tpu_sampling_metadata.use_beam_search:
+        if use_beam_search:
             logger.info(f"DEBUG: Entering Native Beam Search loop. Batch size={num_reqs}, Requests={req_ids}")
             assert num_reqs == 1, f"Expected 1 request in batch for beam search, got {num_reqs}!"
             first_req_id = req_ids[0]
