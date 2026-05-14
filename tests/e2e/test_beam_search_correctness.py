@@ -18,38 +18,22 @@ def test_beam_search():
         "The most unexpected thing happened when I opened the door,",
     ]
     
-    # --- Subtest 1: Native Beam Search vs Greedy (OUR Codepath) ---
+    # --- Subtest 1: Native Beam Search (Our Codepath) ---
     print("\n--- Subtest 1: Native Beam Search (Our Codepath) ---")
-    
-    greedy_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=4,
-        ignore_eos=True,
-        logprobs=1,
-    )
     
     beam_params1 = SamplingParams(
         temperature=0.0,
         max_tokens=4,
         ignore_eos=True,
         use_beam_search=True,
-        logprobs=1,
-        n=1,  # Set to 1 to execute internally as single request with devices unrolled
-        extra_args={"beam_width": 30},
+        n=30,
     )
-    
-    print("Running Greedy Inference...")
-    greedy_outputs = llm.generate(prompts, greedy_params)
     
     print("Running Native Beam Search Inference...")
     beam_outputs1 = llm.generate(prompts, beam_params1)
     
-    assert len(greedy_outputs) == len(beam_outputs1)
-    
-    for i, (greedy, beam) in enumerate(zip(greedy_outputs, beam_outputs1)):
-        greedy_text = greedy.outputs[0].text.strip()
+    for i, beam in enumerate(beam_outputs1):
         print(f"\nPrompt: {prompts[i]}")
-        print(f"  Greedy: {greedy_text}")
         print(f"  Native Beam Search Results:")
         for j, output in enumerate(beam.outputs):
             print(f"    Beam {j}: {output.text.strip()}")
