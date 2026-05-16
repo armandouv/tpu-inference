@@ -120,15 +120,14 @@ def _shuffle_kv_caches(kv_caches, parent_beam_ids, block_tables_2d, beam_width, 
     return [shuffle_layer(c) for c in kv_caches]
 
 
-@jax.jit(static_argnames=("beam_width", "pad_token_id"))
-def _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id):
+@jax.jit(static_argnames=("beam_width",))
+def _select_next_beams(logits_step, cum_logprobs, beam_width):
     """Selects the top-k candidates across all beams.
 
     Args:
         logits_step: Logits for the current step, shape (beam_width, vocab_size).
         cum_logprobs: Cumulative logprobs for the current beams, shape (beam_width,).
         beam_width: Number of beams to maintain.
-        pad_token_id: Token ID to mask out.
 
     Returns:
         parent_beam_ids: Indices of parent beams for the selected candidates, shape (beam_width,).
@@ -150,7 +149,7 @@ def _select_next_beams(logits_step, cum_logprobs, beam_width, pad_token_id):
     
     return parent_beam_ids, token_ids, top_scores
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 18, 19, 20, 21, 22, 23, 24), donate_argnums=(9, 14))
+@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 18, 19, 20, 21, 22), donate_argnums=(9, 14))
 def _native_beam_search_loop_jit(
     model_fn, compute_logits_fn, select_from_array_fn,
     max_tokens, beam_width, padded_beam_width, block_size, vocab_size,
@@ -158,7 +157,7 @@ def _native_beam_search_loop_jit(
     cur_positions, cur_seq_lens, cur_block_tables,
     cur_query_start_loc, cur_request_distribution, lora_metadata,
     is_first_rank, is_last_rank, layer_name_to_kvcache_index,
-    start_block_idx, pad_token_id, eos_token_id, valid_tokens
+    start_block_idx, valid_tokens
 ):
     """Executes the autoregressive decoding loop for beam search on TPU.
 
@@ -170,12 +169,8 @@ def _native_beam_search_loop_jit(
     all_tokens = all_tokens.at[0].set(next_tokens)
     
     for step in range(1, max_tokens):
-        # Mask out finished/completed beams to prevent them from generating NaNs and continuing execution
-        is_eos = (next_tokens.ravel() == eos_token_id) | (next_tokens.ravel() == pad_token_id)
-        cur_input_tokens = jnp.where(is_eos[:, None], pad_token_id, next_tokens)
-
         cur_input_ids_padded = jnp.zeros((padded_beam_width, 1), dtype=next_tokens.dtype)
-        cur_input_ids_padded = cur_input_ids_padded.at[:beam_width].set(cur_input_tokens)
+        cur_input_ids_padded = cur_input_ids_padded.at[:beam_width].set(next_tokens)
         
         cur_positions = cur_positions + 1
         cur_seq_lens = cur_seq_lens + 1
@@ -203,9 +198,8 @@ def _native_beam_search_loop_jit(
         logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
         logits_step = logits_step.astype(jnp.float32)[:beam_width]
 
-        cum_logprobs_masked = jnp.where(is_eos, -jnp.inf, cum_logprobs)
         parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(
-            logits_step, cum_logprobs_masked, beam_width, pad_token_id)
+            logits_step, cum_logprobs, beam_width)
 
         # Calculate prompt_len dynamically (it is fixed for the batch)
         # At step S, cur_seq_lens[0] is prompt_len + S.
@@ -1318,21 +1312,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             lora_metadata = self.lora_utils.extract_lora_metadata()
             vocab_size = logits_step.shape[-1]
 
-            # Extract pad_token_id and eos_token_id programmatically!
-            pad_token_id = getattr(self.model_config.hf_config, "pad_token_id", None)
-            if pad_token_id is None:
-                pad_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
-            if isinstance(pad_token_id, list):
-                pad_token_id = pad_token_id[0]
-            if pad_token_id is None:
-                pad_token_id = 0 # Fallback to 0 if both are None!
-
-            eos_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
-            if isinstance(eos_token_id, list):
-                eos_token_id = eos_token_id[0]
-            if eos_token_id is None:
-                eos_token_id = pad_token_id
-
             # TODO(armandouv): Fix nan issues.
             # TODO(armandouv): Compare exact outputs in test. Test the 3 scenarios.
             # We only do the CoW copy if the last prompt block is not full!
@@ -1354,8 +1333,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 is_last_rank=self.is_last_rank,
                 layer_name_to_kvcache_index=tuple(self.layer_name_to_kvcache_index.items()),
                 start_block_idx=last_prompt_block_idx,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
                 valid_tokens=valid_tokens
             )
             self.kv_caches = list(new_kv_caches)
