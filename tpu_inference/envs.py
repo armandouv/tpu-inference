@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_SAVE_THREADS: int = 1
     TPU_OFFLOAD_BATCHED_SAVE: bool = False
     TPU_OFFLOAD_METRICS_LOG_INTERVAL: int = 5
+    BEAM_SEARCH_PRECOMPILE_WIDTHS: list[int] = [30, 100]
+    BEAM_SEARCH_PRECOMPILE_MAX_TOKENS: list[int] = [4]
 
 
 def env_with_choices(
@@ -281,6 +283,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kv offload to dram: prometheus metrics log interval in seconds
     "TPU_OFFLOAD_METRICS_LOG_INTERVAL":
     lambda: int(os.getenv("TPU_OFFLOAD_METRICS_LOG_INTERVAL", "10")),
+    # Custom list of beam widths to precompile during engine start
+    "BEAM_SEARCH_PRECOMPILE_WIDTHS":
+    lambda: [int(x.strip()) for x in val.split(",")] if (val := os.getenv("BEAM_SEARCH_PRECOMPILE_WIDTHS")) else [30, 100],
+    # Custom list of beam search max token lengths to precompile during engine start
+    "BEAM_SEARCH_PRECOMPILE_MAX_TOKENS":
+    lambda: [int(x.strip()) for x in val.split(",")] if (val := os.getenv("BEAM_SEARCH_PRECOMPILE_MAX_TOKENS")) else [4],
 }
 
 

@@ -149,91 +149,6 @@ def _select_next_beams(logits_step, cum_logprobs, beam_width):
     
     return parent_beam_ids, token_ids, top_scores
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 18, 19, 20, 21, 22), donate_argnums=(9, 14))
-def _native_beam_search_loop_jit(
-    model_fn, compute_logits_fn, select_from_array_fn,
-    max_tokens, beam_width, padded_beam_width, block_size, vocab_size,
-    state, kv_caches, next_tokens, cum_logprobs,
-    cur_positions, cur_seq_lens, cur_block_tables,
-    cur_query_start_loc, cur_request_distribution, lora_metadata,
-    is_first_rank, is_last_rank, layer_name_to_kvcache_index,
-    start_block_idx, valid_tokens
-):
-    """Executes the autoregressive decoding loop for beam search on TPU.
-
-    This function runs the full generation loop on-device to avoid host-device
-    round trips. It shuffles KV caches at each step to maintain beam history.
-    """
-    # Pre-allocate array for outputs!
-    all_tokens = jnp.zeros((max_tokens, beam_width, 1), dtype=next_tokens.dtype)
-    all_tokens = all_tokens.at[0].set(next_tokens)
-    
-    for step in range(1, max_tokens):
-        cur_input_ids_padded = jnp.zeros((padded_beam_width, 1), dtype=next_tokens.dtype)
-        cur_input_ids_padded = cur_input_ids_padded.at[:beam_width].set(next_tokens)
-        
-        cur_positions = cur_positions + 1
-        cur_seq_lens = cur_seq_lens + 1
-
-        cur_block_tables_1d = cur_block_tables.reshape(-1)
-        
-        from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-        step_attn_metadata = AttentionMetadata(
-            input_positions=cur_positions,
-            block_tables=cur_block_tables_1d,
-            seq_lens=cur_seq_lens,
-            query_start_loc=cur_query_start_loc,
-            request_distribution=cur_request_distribution
-        )
-        
-        (kv_caches, hidden_states, _) = model_fn(
-            state, kv_caches, cur_input_ids_padded.ravel(), step_attn_metadata,
-            None, cur_positions, layer_name_to_kvcache_index, lora_metadata,
-            None, is_first_rank, is_last_rank
-        )
-        
-        cur_logits_indices = jnp.arange(beam_width, dtype=jnp.int32)
-        hidden_states = select_from_array_fn(hidden_states, cur_logits_indices)
-
-        logits_step = compute_logits_fn(state, hidden_states, lora_metadata)
-        logits_step = logits_step.astype(jnp.float32)[:beam_width]
-
-        parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(
-            logits_step, cum_logprobs, beam_width)
-
-        # Calculate prompt_len dynamically (it is fixed for the batch)
-        # At step S, cur_seq_lens[0] is prompt_len + S.
-        prompt_len = cur_seq_lens[0] - step
-        # Last block the prompt was written to.
-        last_prompt_block_idx = (prompt_len - 1) // block_size
-        
-        # Last prompt generated tokens have been written to.
-        current_block_idx = (cur_seq_lens[0] - 1) // block_size
-        
-        # Whether we wrote into the extra block for this step.
-        crossed_boundary = (current_block_idx > last_prompt_block_idx).astype(jnp.int32)
-        
-        parent_completed_block = cur_block_tables[parent_beam_ids, last_prompt_block_idx]
-        current_child_block = cur_block_tables[:beam_width, last_prompt_block_idx]
-        
-        # Update the previous block also if we crossed the boundary. If not, just
-        # write the same block.
-        # If the prompt filled blocks perfectly, we update it with the same prefix.
-        new_block = crossed_boundary * parent_completed_block + (1 - crossed_boundary) * current_child_block
-
-        cur_block_tables = cur_block_tables.at[:beam_width, last_prompt_block_idx].set(new_block)
-        
-        # We don't need to shuffle the kv-caches on the last step
-        if step < max_tokens - 1:
-            kv_caches = _shuffle_kv_caches(kv_caches, parent_beam_ids, cur_block_tables, beam_width, current_block_idx)
-            
-        next_tokens = token_ids.reshape(beam_width, 1)
-        
-        # Update outputs!
-        all_tokens = all_tokens.at[step].set(next_tokens)
-        all_tokens = all_tokens.at[:step].set(all_tokens[:step, parent_beam_ids])
-        
-    return kv_caches, all_tokens, cum_logprobs
 
 @functools.partial(jax.jit, static_argnames=("beam_width",), donate_argnums=(0,))
 def _cow_block_copy_jit(kv_caches, old_block_id, cow_block_ids_jax, beam_width):
@@ -842,6 +757,89 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if has_kv_transfer_group():
             get_kv_transfer_group().register_runner(self)
 
+    @functools.partial(
+        jax.jit,
+        static_argnums=(0, 1, 2, 3),  # self, max_tokens, beam_width, padded_beam_width
+        donate_argnums=(5, 10)        # kv_caches, cur_block_tables
+    )
+    def _native_beam_search_loop_jit(
+        self, max_tokens, beam_width, padded_beam_width,
+        state, kv_caches, next_tokens, cum_logprobs,
+        cur_positions, cur_seq_lens, cur_block_tables,
+        cur_query_start_loc, cur_request_distribution, lora_metadata
+    ):
+        """Executes the autoregressive decoding loop for beam search on TPU."""
+        # Pre-allocate array for outputs!
+        all_tokens = jnp.zeros((max_tokens, beam_width, 1), dtype=next_tokens.dtype)
+        all_tokens = all_tokens.at[0].set(next_tokens)
+        
+        for step in range(1, max_tokens):
+            cur_input_ids_padded = jnp.zeros((padded_beam_width, 1), dtype=next_tokens.dtype)
+            cur_input_ids_padded = cur_input_ids_padded.at[:beam_width].set(next_tokens)
+            
+            cur_positions = cur_positions + 1
+            cur_seq_lens = cur_seq_lens + 1
+
+            cur_block_tables_1d = cur_block_tables.reshape(-1)
+            
+            from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+            step_attn_metadata = AttentionMetadata(
+                input_positions=cur_positions,
+                block_tables=cur_block_tables_1d,
+                seq_lens=cur_seq_lens,
+                query_start_loc=cur_query_start_loc,
+                request_distribution=cur_request_distribution
+            )
+            
+            (kv_caches, hidden_states, _) = self.model_fn(
+                state, kv_caches, cur_input_ids_padded.ravel(), step_attn_metadata,
+                None, cur_positions, tuple(self.layer_name_to_kvcache_index.items()), lora_metadata,
+                None, self.is_first_rank, self.is_last_rank
+            )
+            
+            cur_logits_indices = jnp.arange(beam_width, dtype=jnp.int32)
+            hidden_states = self._select_from_array_fn(hidden_states, cur_logits_indices)
+
+            logits_step = self.compute_logits_fn(state, hidden_states, lora_metadata)
+            logits_step = logits_step.astype(jnp.float32)[:beam_width]
+
+            parent_beam_ids, token_ids, cum_logprobs = _select_next_beams(
+                logits_step, cum_logprobs, beam_width)
+
+            # Calculate prompt_len dynamically (it is fixed for the batch)
+            # At step S, cur_seq_lens[0] is prompt_len + S.
+            prompt_len = cur_seq_lens[0] - step
+            # Last block the prompt was written to.
+            last_prompt_block_idx = (prompt_len - 1) // self.block_size
+            
+            # Last prompt generated tokens have been written to.
+            current_block_idx = (cur_seq_lens[0] - 1) // self.block_size
+            
+            # Whether we wrote into the extra block for this step.
+            crossed_boundary = (current_block_idx > last_prompt_block_idx).astype(jnp.int32)
+            
+            parent_completed_block = cur_block_tables[parent_beam_ids, last_prompt_block_idx]
+            current_child_block = cur_block_tables[:beam_width, last_prompt_block_idx]
+            
+            # Update the previous block also if we crossed the boundary. If not, just
+            # write the same block.
+            # If the prompt filled blocks perfectly, we update it with the same prefix.
+            new_block = crossed_boundary * parent_completed_block + (1 - crossed_boundary) * current_child_block
+
+            cur_block_tables = cur_block_tables.at[:beam_width, last_prompt_block_idx].set(new_block)
+            
+            # We don't need to shuffle the kv-caches on the last step
+            if step < max_tokens - 1:
+                kv_caches = _shuffle_kv_caches(kv_caches, parent_beam_ids, cur_block_tables, beam_width, current_block_idx)
+                
+            next_tokens = token_ids.reshape(beam_width, 1)
+            
+            # Update outputs!
+            all_tokens = all_tokens.at[step].set(next_tokens)
+            all_tokens = all_tokens.at[:step].set(all_tokens[:step, parent_beam_ids])
+            
+        return kv_caches, all_tokens, cum_logprobs
+
     def delete_kv_cache(self) -> None:
         self.kv_cache_manager.delete_kv_cache()
 
@@ -1310,7 +1308,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             cum_logprobs = initial_beam_logprobs
             
             lora_metadata = self.lora_utils.extract_lora_metadata()
-            vocab_size = logits_step.shape[-1]
 
             # TODO(armandouv): Fix nan issues.
             # TODO(armandouv): Compare exact outputs in test. Test the 3 scenarios.
@@ -1319,21 +1316,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if valid_tokens > 0:
                 self.kv_caches = _cow_block_copy_jit(self.kv_caches, old_block_id, cow_block_ids_jax, beam_width)
             kv_caches_list = list(self.kv_caches)
-            (new_kv_caches, jitted_tokens, cum_logprobs) = _native_beam_search_loop_jit(
-                self.model_fn, self.compute_logits_fn, self._select_from_array_fn,
-                max_tokens, beam_width, padded_beam_width, self.block_size, vocab_size,
+            (new_kv_caches, jitted_tokens, cum_logprobs) = self._native_beam_search_loop_jit(
+                max_tokens, beam_width, padded_beam_width,
                 self.state, kv_caches_list, next_tokens, cum_logprobs,
                 cur_positions=cur_positions,
                 cur_seq_lens=cur_seq_lens,
                 cur_block_tables=cur_block_tables,
                 cur_query_start_loc=cur_query_start_loc,
                 cur_request_distribution=cur_request_distribution,
-                lora_metadata=lora_metadata,
-                is_first_rank=self.is_first_rank,
-                is_last_rank=self.is_last_rank,
-                layer_name_to_kvcache_index=tuple(self.layer_name_to_kvcache_index.items()),
-                start_block_idx=last_prompt_block_idx,
-                valid_tokens=valid_tokens
+                lora_metadata=lora_metadata
             )
             self.kv_caches = list(new_kv_caches)
             

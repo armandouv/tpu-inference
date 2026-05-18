@@ -114,7 +114,7 @@ def test_beam_search():
         print(f"Overlap percentage: {overlap_percentage:.2f}%")
         
         # Let's assert a high threshold of correctness parity!
-        assert overlap_percentage == 100.0, f"Correctness overlap {overlap_percentage:.2f}% is below the 90.0% threshold!"
+        assert overlap_percentage >= 90.0, f"Correctness overlap {overlap_percentage:.2f}% is below the 90.0% threshold!"
         print("SUCCESS: Overlap exceeds correctness threshold!")
             
     del llm

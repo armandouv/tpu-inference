@@ -121,6 +121,7 @@ class CompilationManager:
             if not self._gather_logprobs_precompiled:
                 self._precompile_gather_logprobs()
             self._precompile_structured_decoding()
+            self._precompile_beam_search()
             if self.runner.speculative_config:
                 self._precompile_speculative_decoding()
 
@@ -999,3 +1000,140 @@ class CompilationManager:
                 arange,
                 num_reqs=num_reqs,
             )
+
+    # TODO(armandouv): This improves first request compilation time but it's still non-zero.
+    # Figure out why this is and fix it.
+    def _precompile_beam_search(self) -> None:
+        logger.info("Compiling custom beam search functions with different input shapes.")
+        from tpu_inference.runner.tpu_runner import (
+            _select_next_beams, _cow_block_copy_jit, _shuffle_kv_caches
+        )
+        import gc
+        
+        vocab_size = self.runner.model_config.get_vocab_size()
+        block_size = self.runner.block_size
+        max_num_blocks = self.runner.max_num_blocks_per_req
+        
+        # Get configured beam widths and max tokens from environment variables
+        beam_widths = envs.BEAM_SEARCH_PRECOMPILE_WIDTHS
+        max_tokens_list = envs.BEAM_SEARCH_PRECOMPILE_MAX_TOKENS
+        
+        for beam_width in beam_widths:
+            logger.info(f"Precompiling beam search helper functions for beam_width={beam_width}")
+            
+            # 1. Precompile _select_next_beams
+            logits_sharding = NamedSharding(
+                self.runner.mesh,
+                PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
+            logits_step = self._create_dummy_tensor((beam_width, vocab_size), jnp.float32, logits_sharding)
+            cum_logprobs = self._create_dummy_tensor((beam_width,), jnp.float32)
+            
+            self._run_compilation(
+                f"select_next_beams [beam_width={beam_width}]",
+                _select_next_beams,
+                logits_step, cum_logprobs, beam_width,
+            )
+            # TODO(armandouv): Delete this since it's probably not necessary.
+            logits_step = None
+            cum_logprobs = None
+            gc.collect()
+            
+            # 2. Precompile _cow_block_copy_jit
+            if self.runner.kv_caches:
+                old_block_id = jnp.array(0, dtype=jnp.int32)
+                cow_block_ids_jax = jnp.zeros((beam_width,), dtype=jnp.int32)
+                self._run_compilation(
+                    f"cow_block_copy_jit [beam_width={beam_width}]",
+                    _cow_block_copy_jit,
+                    self.runner.kv_caches, old_block_id, cow_block_ids_jax, beam_width,
+                )
+                cow_block_ids_jax = None
+                old_block_id = None
+                gc.collect()
+                
+                # Reinitialize KV cache to clear donated buffers and allocate fresh arrays!
+                from vllm.config.vllm import set_current_vllm_config
+                with set_current_vllm_config(self.runner.vllm_config):
+                    self.runner.kv_caches.clear()
+                    self.runner.layer_name_to_kvcache_index.clear()
+                    self.runner.kv_cache_manager.reinitialize_kv_cache()
+                gc.collect()
+                
+                # 3. Precompile _shuffle_kv_caches
+                parent_beam_ids = jnp.zeros((beam_width,), dtype=jnp.int32)
+                block_tables_2d = jnp.zeros((beam_width, max_num_blocks), dtype=jnp.int32)
+                current_block_idx = jnp.array(0, dtype=jnp.int32)
+                self._run_compilation(
+                    f"shuffle_kv_caches [beam_width={beam_width}]",
+                    _shuffle_kv_caches,
+                    self.runner.kv_caches, parent_beam_ids, block_tables_2d, beam_width, current_block_idx,
+                )
+                parent_beam_ids = None
+                block_tables_2d = None
+                current_block_idx = None
+                gc.collect()
+                
+                # Reinitialize KV cache to clear donated buffers and allocate fresh arrays!
+                with set_current_vllm_config(self.runner.vllm_config):
+                    self.runner.kv_caches.clear()
+                    self.runner.layer_name_to_kvcache_index.clear()
+                    self.runner.kv_cache_manager.reinitialize_kv_cache()
+                gc.collect()
+                
+            # 4. Precompile _native_beam_search_loop_jit for each target max_tokens
+            for max_tokens in max_tokens_list:
+                logger.info(f"Precompiling native_beam_search_loop_jit for beam_width={beam_width}, max_tokens={max_tokens}")
+                padded_beam_width = 32 if beam_width <= 32 else 128
+                
+                next_tokens = jnp.zeros((beam_width, 1), dtype=jnp.int32)
+                cum_logprobs_loop = jnp.zeros((beam_width,), dtype=jnp.float32)
+                
+                cur_positions = jnp.zeros((padded_beam_width,), dtype=jnp.int32)
+                cur_seq_lens = jnp.zeros((padded_beam_width,), dtype=jnp.int32)
+                cur_block_tables = jnp.zeros((padded_beam_width, max_num_blocks), dtype=jnp.int32)
+                cur_query_start_loc = jnp.arange(0, padded_beam_width + 1, dtype=jnp.int32)
+                cur_request_distribution = jnp.array([beam_width, beam_width, beam_width], dtype=jnp.int32)
+                lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+                layer_name_to_kvcache_index = tuple(self.runner.layer_name_to_kvcache_index.items())
+                
+                if self.runner.kv_caches:
+                    self._run_compilation(
+                        f"native_beam_search_loop_jit [beam_width={beam_width}, max_tokens={max_tokens}]",
+                        self.runner._native_beam_search_loop_jit,
+                        max_tokens, beam_width, padded_beam_width,
+                        self.runner.state, self.runner.kv_caches, next_tokens, cum_logprobs_loop,
+                        cur_positions,
+                        cur_seq_lens,
+                        cur_block_tables,
+                        cur_query_start_loc,
+                        cur_request_distribution,
+                        lora_metadata
+                    )
+                    next_tokens = None
+                    cum_logprobs_loop = None
+                    cur_positions = None
+                    cur_seq_lens = None
+                    cur_block_tables = None
+                    cur_query_start_loc = None
+                    cur_request_distribution = None
+                    gc.collect()
+                    
+                    # Reinitialize KV cache for the next iteration/beam search to clean up loop donated buffers!
+                    with set_current_vllm_config(self.runner.vllm_config):
+                        self.runner.kv_caches.clear()
+                        self.runner.layer_name_to_kvcache_index.clear()
+                        self.runner.kv_cache_manager.reinitialize_kv_cache()
+                    gc.collect()
+        
+        # Final clean reinitialization of the KV caches for serving
+        if self.runner.kv_caches:
+            logger.info("Final reinitialization of model runner KV caches to clean fresh arrays on device after beam search precompilation")
+            with set_current_vllm_config(self.runner.vllm_config):
+                self.runner.kv_caches.clear()
+                self.runner.layer_name_to_kvcache_index.clear()
+                self.runner.kv_cache_manager.reinitialize_kv_cache()
+            gc.collect()
+
+
+
+
