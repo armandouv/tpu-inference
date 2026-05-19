@@ -131,6 +131,7 @@ class InputBatch:
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
         self.req_output_token_ids: list[Optional[list[int]]] = []
+        self.use_beam_search = np.zeros(max_num_reqs, dtype=bool)
 
         self.request_distribution: list[int] = [0, 0, 0]
 
@@ -226,6 +227,7 @@ class InputBatch:
             if top_k >= self.vocab_size:
                 top_k = -1
             self.top_k_cpu[req_index] = top_k
+            self.use_beam_search[req_index] = sampling_params.use_beam_search
             if sampling_params.min_tokens:
                 self.min_tokens[req_index] = (
                     sampling_params.min_tokens,

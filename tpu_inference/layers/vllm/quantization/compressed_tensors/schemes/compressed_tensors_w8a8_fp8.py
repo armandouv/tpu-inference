@@ -28,6 +28,8 @@ from vllm.model_executor.kernels.linear.scaled_mm import \
     FP8ScaledMMLinearLayerConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import \
     CompressedTensorsW8A8Fp8
+from vllm.model_executor.layers.quantization.utils.quant_utils import \
+    GroupShape
 from vllm.platforms import PlatformEnum
 
 from tpu_inference.layers.common.linear import sharded_quantized_matmul
